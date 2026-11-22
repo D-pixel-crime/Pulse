@@ -1,0 +1,47 @@
+# Environment configurations
+.env
+.env.*
+!.env.example
+
+# Go build outputs and application binaries
+bin/
+dist/
+/pulse
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries and test coverage profiles
+*.test
+*.out
+coverage/
+coverage.html
+*.coverprofile
+
+# Logs
+*.log
+logs/
+
+# Editor and IDE metadata
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# Operating System metadata
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Local-only project planning and agent instructions
+/docs/
+/AGENTS.md
