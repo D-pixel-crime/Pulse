@@ -10,6 +10,7 @@ import (
 
 	"pulse/internal/app"
 	"pulse/internal/config"
+	"pulse/internal/db"
 )
 
 func main() {
@@ -33,16 +34,31 @@ func run() error {
 		return fmt.Errorf("configuration error: %w", err)
 	}
 
+	// Listen for termination signals for graceful shutdown
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Initialize database connection pool with sensible limits and ping at startup
+	database, err := db.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		logger.Error("failed to connect to database", slog.String("error", err.Error()))
+		return fmt.Errorf("database connection error: %w", err)
+	}
+	defer database.Close()
+
+	// Execute idempotent initial schema setup
+	if err := database.RunSchema(ctx); err != nil {
+		logger.Error("failed to initialize database schema", slog.String("error", err.Error()))
+		return fmt.Errorf("database schema error: %w", err)
+	}
+	logger.Info("database schema initialized successfully")
+
 	// Initialize application composition root
-	application, err := app.New(cfg, logger)
+	application, err := app.New(cfg, logger, app.WithDB(database))
 	if err != nil {
 		logger.Error("failed to initialize application", slog.String("error", err.Error()))
 		return fmt.Errorf("application initialization error: %w", err)
 	}
-
-	// Listen for termination signals for graceful shutdown
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	// Run application lifecycle
 	if err := application.Run(ctx); err != nil {

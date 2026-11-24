@@ -8,6 +8,8 @@ import (
 
 	"pulse/internal/api"
 	"pulse/internal/config"
+	"pulse/internal/db"
+	"pulse/internal/store"
 )
 
 // App is the root composition point for the Pulse monitoring service.
@@ -15,6 +17,8 @@ type App struct {
 	cfg    *config.Config
 	logger *slog.Logger
 	server *api.Server
+	db     *db.DB
+	store  *store.Store
 }
 
 // Option configures optional App attributes.
@@ -24,6 +28,23 @@ type Option func(*App)
 func WithServer(s *api.Server) Option {
 	return func(a *App) {
 		a.server = s
+	}
+}
+
+// WithDB configures the database connection for the application.
+func WithDB(database *db.DB) Option {
+	return func(a *App) {
+		a.db = database
+		if database != nil && database.Pool() != nil && a.store == nil {
+			a.store = store.New(database.Pool())
+		}
+	}
+}
+
+// WithStore allows injecting a custom or test store instance.
+func WithStore(s *store.Store) Option {
+	return func(a *App) {
+		a.store = s
 	}
 }
 
@@ -39,11 +60,18 @@ func New(cfg *config.Config, logger *slog.Logger, opts ...Option) (*App, error) 
 	appInstance := &App{
 		cfg:    cfg,
 		logger: logger,
-		server: api.NewServer(cfg.AppAddr, logger),
 	}
 
 	for _, opt := range opts {
 		opt(appInstance)
+	}
+
+	if appInstance.server == nil {
+		var readyChecker api.ReadyChecker
+		if appInstance.db != nil {
+			readyChecker = appInstance.db
+		}
+		appInstance.server = api.NewServer(cfg.AppAddr, logger, api.WithReadyChecker(readyChecker))
 	}
 
 	return appInstance, nil
@@ -64,20 +92,22 @@ func (a *App) Server() *api.Server {
 	return a.server
 }
 
+// DB returns the configured database connection wrapper.
+func (a *App) DB() *db.DB {
+	return a.db
+}
+
+// Store returns the configured monitor store.
+func (a *App) Store() *store.Store {
+	return a.store
+}
+
 // Run executes the application lifecycle.
 // It serves as the composition point for server and background components.
 func (a *App) Run(ctx context.Context) error {
 	a.logger.Info("pulse application initialized",
 		slog.Any("config", a.cfg),
 	)
-
-	// Subsystem composition points for subsequent implementation phases:
-	// - Phase 2: db.Connect(ctx, a.cfg.DatabaseURL) & db.RunSchema(ctx, db)
-	// - Phase 3: checker.NewSafeChecker(...)
-	// - Phase 4: store.New(db)
-	// - Phase 5: scheduler.New(...), worker.NewPool(...)
-	// - Phase 6: api.NewServer(a.cfg.AppAddr, ...) (instantiated in app root)
-	// - Phase 7: graceful shutdown of server, scheduler, worker pool, and db pool
 
 	a.logger.Info("pulse foundation running; awaiting termination signal")
 

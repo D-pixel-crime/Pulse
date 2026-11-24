@@ -32,6 +32,25 @@ func TestApp_New(t *testing.T) {
 		if a.Server() == nil {
 			t.Errorf("expected non-nil server")
 		}
+		if a.DB() != nil {
+			t.Errorf("expected nil DB when not configured, got %v", a.DB())
+		}
+		if a.Store() != nil {
+			t.Errorf("expected nil Store when not configured, got %v", a.Store())
+		}
+	})
+
+	t.Run("with custom store and nil db", func(t *testing.T) {
+		a, err := app.New(cfg, logger, app.WithDB(nil), app.WithStore(nil))
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if a.DB() != nil {
+			t.Errorf("expected nil DB, got %v", a.DB())
+		}
+		if a.Store() != nil {
+			t.Errorf("expected nil Store, got %v", a.Store())
+		}
 	})
 
 	t.Run("nil config returns error", func(t *testing.T) {

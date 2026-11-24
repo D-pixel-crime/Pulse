@@ -55,13 +55,19 @@ type Router struct {
 }
 
 // NewRouter constructs a configured router with all foundation routes and fallback error handling.
-func NewRouter(logger *slog.Logger) http.Handler {
+func NewRouter(logger *slog.Logger, checkers ...ReadyChecker) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
+	var checker ReadyChecker
+	if len(checkers) > 0 {
+		checker = checkers[0]
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", HealthzHandler())
+	mux.HandleFunc("GET /readyz", ReadyzHandler(checker))
 
 	return &Router{
 		mux:    mux,
@@ -94,10 +100,19 @@ type Server struct {
 	logger          *slog.Logger
 	shutdownTimeout time.Duration
 	listener        net.Listener
+	readyChecker    ReadyChecker
 }
 
 // Option provides functional options for configuring a Server instance.
 type Option func(*Server)
+
+// WithReadyChecker configures the database connectivity checker for the GET /readyz probe.
+func WithReadyChecker(checker ReadyChecker) Option {
+	return func(s *Server) {
+		s.readyChecker = checker
+		s.httpServer.Handler = NewRouter(s.logger, checker)
+	}
+}
 
 // WithShutdownTimeout customizes the graceful shutdown deadline timeout.
 func WithShutdownTimeout(d time.Duration) Option {
