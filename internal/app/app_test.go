@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"net"
 	"testing"
 	"time"
 
+	"pulse/internal/api"
 	"pulse/internal/app"
 	"pulse/internal/config"
 )
@@ -26,6 +28,9 @@ func TestApp_New(t *testing.T) {
 		}
 		if a.Logger() != logger {
 			t.Errorf("expected logger %v, got %v", logger, a.Logger())
+		}
+		if a.Server() == nil {
+			t.Errorf("expected non-nil server")
 		}
 	})
 
@@ -52,7 +57,15 @@ func TestApp_Run(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
 
-	a, err := app.New(cfg, logger)
+	// Inject an ephemeral listener to guarantee zero port collisions during concurrent test execution
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+	defer ln.Close()
+
+	srv := api.NewServer(ln.Addr().String(), logger, api.WithListener(ln))
+	a, err := app.New(cfg, logger, app.WithServer(srv))
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
