@@ -71,7 +71,14 @@ func New(cfg *config.Config, logger *slog.Logger, opts ...Option) (*App, error) 
 		if appInstance.db != nil {
 			readyChecker = appInstance.db
 		}
-		appInstance.server = api.NewServer(cfg.AppAddr, logger, api.WithReadyChecker(readyChecker))
+		var monitorRepo api.MonitorRepository
+		if appInstance.store != nil {
+			monitorRepo = appInstance.store
+		}
+		appInstance.server = api.NewServer(cfg.AppAddr, logger,
+			api.WithReadyChecker(readyChecker),
+			api.WithMonitorRepository(monitorRepo),
+		)
 	}
 
 	return appInstance, nil

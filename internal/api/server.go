@@ -56,6 +56,11 @@ type Router struct {
 
 // NewRouter constructs a configured router with all foundation routes and fallback error handling.
 func NewRouter(logger *slog.Logger, checkers ...ReadyChecker) http.Handler {
+	return NewRouterWithRepo(logger, nil, checkers...)
+}
+
+// NewRouterWithRepo constructs a configured router including monitor CRUD routes when repo is non-nil.
+func NewRouterWithRepo(logger *slog.Logger, repo MonitorRepository, checkers ...ReadyChecker) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -68,6 +73,10 @@ func NewRouter(logger *slog.Logger, checkers ...ReadyChecker) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", HealthzHandler())
 	mux.HandleFunc("GET /readyz", ReadyzHandler(checker))
+
+	if repo != nil {
+		RegisterMonitorRoutes(mux, repo, logger)
+	}
 
 	return &Router{
 		mux:    mux,
@@ -91,7 +100,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.ServeHTTP(w, r)
+	rt.mux.ServeHTTP(w, r)
 }
 
 // Server encapsulates the HTTP server, configured timeouts, and graceful shutdown lifecycle.
@@ -101,6 +110,7 @@ type Server struct {
 	shutdownTimeout time.Duration
 	listener        net.Listener
 	readyChecker    ReadyChecker
+	monitorRepo     MonitorRepository
 }
 
 // Option provides functional options for configuring a Server instance.
@@ -110,7 +120,15 @@ type Option func(*Server)
 func WithReadyChecker(checker ReadyChecker) Option {
 	return func(s *Server) {
 		s.readyChecker = checker
-		s.httpServer.Handler = NewRouter(s.logger, checker)
+		s.httpServer.Handler = NewRouterWithRepo(s.logger, s.monitorRepo, checker)
+	}
+}
+
+// WithMonitorRepository configures the repository for monitor CRUD routes.
+func WithMonitorRepository(repo MonitorRepository) Option {
+	return func(s *Server) {
+		s.monitorRepo = repo
+		s.httpServer.Handler = NewRouterWithRepo(s.logger, repo, s.readyChecker)
 	}
 }
 
