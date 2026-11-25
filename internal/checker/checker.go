@@ -18,6 +18,7 @@ const MaxErrorMessageLength = 1024
 // CheckObservation captures the raw observation of an executed HTTP health check.
 type CheckObservation struct {
 	CheckedAt    time.Time     `json:"checked_at"`
+	CompletedAt  time.Time     `json:"completed_at"`
 	Success      bool          `json:"success"`
 	HTTPStatus   *int          `json:"http_status"`
 	Latency      time.Duration `json:"latency"`
@@ -161,9 +162,11 @@ func (c *Checker) Check(ctx context.Context, target *Target, timeout time.Durati
 	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, target.RawURL(), nil)
 	if err != nil {
 		latency := time.Since(start)
+		completedAt := checkedAt.Add(latency)
 		errMsg := SanitizeErrorMessage(err.Error(), target)
 		return CheckObservation{
 			CheckedAt:    checkedAt,
+			CompletedAt:  completedAt,
 			Success:      false,
 			HTTPStatus:   nil,
 			Latency:      latency,
@@ -177,11 +180,13 @@ func (c *Checker) Check(ctx context.Context, target *Target, timeout time.Durati
 
 	resp, err := c.client.Do(req)
 	latency := time.Since(start)
+	completedAt := checkedAt.Add(latency)
 
 	if err != nil {
 		errMsg := SanitizeErrorMessage(err.Error(), target)
 		return CheckObservation{
 			CheckedAt:    checkedAt,
+			CompletedAt:  completedAt,
 			Success:      false,
 			HTTPStatus:   nil,
 			Latency:      latency,
@@ -199,6 +204,7 @@ func (c *Checker) Check(ctx context.Context, target *Target, timeout time.Durati
 	if statusCode >= 200 && statusCode <= 399 {
 		return CheckObservation{
 			CheckedAt:    checkedAt,
+			CompletedAt:  completedAt,
 			Success:      true,
 			HTTPStatus:   &statusCode,
 			Latency:      latency,
@@ -218,6 +224,7 @@ func (c *Checker) Check(ctx context.Context, target *Target, timeout time.Durati
 
 	return CheckObservation{
 		CheckedAt:    checkedAt,
+		CompletedAt:  completedAt,
 		Success:      false,
 		HTTPStatus:   &statusCode,
 		Latency:      latency,

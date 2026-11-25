@@ -90,6 +90,12 @@ func TestChecker_HealthyStatus(t *testing.T) {
 			if obs.CheckedAt.IsZero() {
 				t.Errorf("expected non-zero CheckedAt timestamp")
 			}
+			if obs.CompletedAt.IsZero() {
+				t.Errorf("expected non-zero CompletedAt timestamp")
+			}
+			if obs.CompletedAt.Before(obs.CheckedAt) {
+				t.Errorf("expected CompletedAt (%v) >= CheckedAt (%v)", obs.CompletedAt, obs.CheckedAt)
+			}
 			if obs.LatencyMs() < 0 {
 				t.Errorf("expected non-negative LatencyMs, got %d", obs.LatencyMs())
 			}

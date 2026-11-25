@@ -6,6 +6,10 @@ import (
 	"github.com/google/uuid"
 )
 
+// MaxErrorMessageLength defines the maximum character length for persisted check error messages,
+// matching the VARCHAR(1024) column limit in PostgreSQL.
+const MaxErrorMessageLength = 1024
+
 // CheckResult represents a single executed health check record stored in PostgreSQL.
 type CheckResult struct {
 	ID           uuid.UUID `json:"id"`

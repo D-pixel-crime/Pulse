@@ -1,0 +1,433 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"pulse/internal/model"
+)
+
+type fakeRow struct {
+	scanFunc func(dest ...any) error
+}
+
+func (r fakeRow) Scan(dest ...any) error {
+	return r.scanFunc(dest...)
+}
+
+type fakeTxCall struct {
+	sql  string
+	args []any
+}
+
+type fakeCheckTx struct {
+	queryRowFunc func(ctx context.Context, sql string, args ...any) pgx.Row
+	commitErr    error
+	calls        []fakeTxCall
+	commitCount  int
+	rollbackCnt  int
+}
+
+func (f *fakeCheckTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	f.calls = append(f.calls, fakeTxCall{sql: sql, args: args})
+	return f.queryRowFunc(ctx, sql, args...)
+}
+
+func (f *fakeCheckTx) Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
+
+func (f *fakeCheckTx) Commit(ctx context.Context) error {
+	f.commitCount++
+	return f.commitErr
+}
+
+func (f *fakeCheckTx) Rollback(ctx context.Context) error {
+	f.rollbackCnt++
+	return nil
+}
+
+func assignMonitorScan(dest []any, m model.Monitor) error {
+	*dest[0].(*uuid.UUID) = m.ID
+	*dest[1].(*string) = m.Name
+	*dest[2].(*string) = m.URL
+	*dest[3].(*int) = m.IntervalSeconds
+	*dest[4].(*int) = m.TimeoutSeconds
+	*dest[5].(*string) = string(m.CurrentStatus)
+	*dest[6].(*int) = m.ConsecutiveFailures
+	*dest[7].(**time.Time) = m.LastCheckedAt
+	*dest[8].(**time.Time) = m.LastSuccessAt
+	*dest[9].(*time.Time) = m.NextCheckAt
+	*dest[10].(*time.Time) = m.CreatedAt
+	*dest[11].(*time.Time) = m.UpdatedAt
+	return nil
+}
+
+func TestRecordCheckResult_NilPoolAndInvalidParams(t *testing.T) {
+	var nilStore *Store
+	if _, err := nilStore.RecordCheckResult(context.Background(), RecordCheckParams{}); err == nil {
+		t.Fatal("expected error for nil store")
+	}
+
+	s := New(nil)
+	if _, err := s.RecordCheckResult(context.Background(), RecordCheckParams{
+		MonitorID: uuid.New(),
+		CheckedAt: time.Now().UTC(),
+	}); err == nil {
+		t.Fatal("expected error for nil pool")
+	}
+
+	if _, err := s.recordCheckResultTx(context.Background(), &fakeCheckTx{}, RecordCheckParams{
+		MonitorID: uuid.Nil,
+		CheckedAt: time.Now().UTC(),
+	}, nil); err == nil {
+		t.Fatal("expected error for nil monitor_id")
+	}
+
+	if _, err := s.recordCheckResultTx(context.Background(), &fakeCheckTx{}, RecordCheckParams{
+		MonitorID: uuid.New(),
+		CheckedAt: time.Time{},
+	}, nil); !errors.Is(err, model.ErrZeroCheckedAt) {
+		t.Fatalf("expected ErrZeroCheckedAt, got %v", err)
+	}
+
+	if _, err := s.recordCheckResultTx(context.Background(), &fakeCheckTx{}, RecordCheckParams{
+		MonitorID: uuid.New(),
+		CheckedAt: time.Now().UTC(),
+		LatencyMs: -1,
+	}, nil); err == nil {
+		t.Fatal("expected error for negative latency_ms")
+	}
+}
+
+func TestRecordCheckResultTx_RollsBackWhenMonitorNotFound(t *testing.T) {
+	s := New(nil)
+	tx := &fakeCheckTx{
+		queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			return fakeRow{scanFunc: func(dest ...any) error {
+				return pgx.ErrNoRows
+			}}
+		},
+	}
+
+	_, err := s.recordCheckResultTx(context.Background(), tx, RecordCheckParams{
+		MonitorID: uuid.New(),
+		CheckedAt: time.Now().UTC(),
+		Success:   true,
+	}, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+	if tx.commitCount != 0 {
+		t.Errorf("expected 0 commits, got %d", tx.commitCount)
+	}
+	if tx.rollbackCnt != 1 {
+		t.Errorf("expected 1 rollback, got %d", tx.rollbackCnt)
+	}
+	if len(tx.calls) != 1 {
+		t.Errorf("expected only SELECT FOR UPDATE to run, got %d calls", len(tx.calls))
+	}
+}
+
+func TestRecordCheckResultTx_RollsBackOnInsertFailure(t *testing.T) {
+	s := New(nil)
+	monitorID := uuid.New()
+	now := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+
+	tx := &fakeCheckTx{
+		queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			if strings.Contains(sql, "SELECT id, name") {
+				return fakeRow{scanFunc: func(dest ...any) error {
+					return assignMonitorScan(dest, model.Monitor{
+						ID:              monitorID,
+						Name:            "API",
+						URL:             "https://example.com",
+						IntervalSeconds: 60,
+						TimeoutSeconds:  5,
+						CurrentStatus:   model.StatusUnknown,
+						NextCheckAt:     now,
+						CreatedAt:       now,
+						UpdatedAt:       now,
+					})
+				}}
+			}
+			if strings.Contains(sql, "INSERT INTO check_results") {
+				return fakeRow{scanFunc: func(dest ...any) error {
+					return errors.New("insert check_results failed")
+				}}
+			}
+			t.Fatalf("unexpected SQL after insert failure: %s", sql)
+			return nil
+		},
+	}
+
+	_, err := s.recordCheckResultTx(context.Background(), tx, RecordCheckParams{
+		MonitorID:   monitorID,
+		CheckedAt:   now,
+		CompletedAt: now.Add(50 * time.Millisecond),
+		Success:     true,
+		LatencyMs:   50,
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "insert check_results failed") {
+		t.Fatalf("expected insert failure error, got %v", err)
+	}
+	if tx.commitCount != 0 {
+		t.Errorf("expected 0 commits, got %d", tx.commitCount)
+	}
+	if tx.rollbackCnt != 1 {
+		t.Errorf("expected 1 rollback, got %d", tx.rollbackCnt)
+	}
+	if len(tx.calls) != 2 {
+		t.Errorf("expected 2 SQL calls (SELECT + INSERT), got %d", len(tx.calls))
+	}
+}
+
+func TestRecordCheckResultTx_RollsBackOnUpdateFailure(t *testing.T) {
+	s := New(nil)
+	monitorID := uuid.New()
+	now := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+	statusCode := 503
+	errText := "HTTP status 503 Service Unavailable"
+
+	tx := &fakeCheckTx{
+		queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			if strings.Contains(sql, "SELECT id, name") {
+				return fakeRow{scanFunc: func(dest ...any) error {
+					return assignMonitorScan(dest, model.Monitor{
+						ID:              monitorID,
+						Name:            "API",
+						URL:             "https://example.com",
+						IntervalSeconds: 60,
+						TimeoutSeconds:  5,
+						CurrentStatus:   model.StatusUnknown,
+						NextCheckAt:     now,
+						CreatedAt:       now,
+						UpdatedAt:       now,
+					})
+				}}
+			}
+			if strings.Contains(sql, "INSERT INTO check_results") {
+				return fakeRow{scanFunc: func(dest ...any) error {
+					*dest[0].(*uuid.UUID) = args[0].(uuid.UUID)
+					*dest[1].(*uuid.UUID) = args[1].(uuid.UUID)
+					*dest[2].(*time.Time) = args[2].(time.Time)
+					*dest[3].(*bool) = args[3].(bool)
+					*dest[4].(**int) = args[4].(*int)
+					*dest[5].(*int64) = args[5].(int64)
+					*dest[6].(**string) = args[6].(*string)
+					return nil
+				}}
+			}
+			if strings.Contains(sql, "UPDATE monitors") {
+				return fakeRow{scanFunc: func(dest ...any) error {
+					return errors.New("update monitors failed")
+				}}
+			}
+			t.Fatalf("unexpected SQL: %s", sql)
+			return nil
+		},
+	}
+
+	_, err := s.recordCheckResultTx(context.Background(), tx, RecordCheckParams{
+		MonitorID:    monitorID,
+		CheckedAt:    now,
+		CompletedAt:  now.Add(120 * time.Millisecond),
+		Success:      false,
+		HTTPStatus:   &statusCode,
+		LatencyMs:    120,
+		ErrorMessage: &errText,
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "update monitors failed") {
+		t.Fatalf("expected update failure error, got %v", err)
+	}
+	if tx.commitCount != 0 {
+		t.Errorf("expected 0 commits, got %d", tx.commitCount)
+	}
+	if tx.rollbackCnt != 1 {
+		t.Errorf("expected 1 rollback, got %d", tx.rollbackCnt)
+	}
+	if len(tx.calls) != 3 {
+		t.Errorf("expected 3 SQL calls (SELECT + INSERT + UPDATE), got %d", len(tx.calls))
+	}
+}
+
+func TestRecordCheckResultTx_RollsBackOnCommitFailure(t *testing.T) {
+	s := New(nil)
+	monitorID := uuid.New()
+	now := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+
+	tx := &fakeCheckTx{
+		commitErr: errors.New("commit failed"),
+		queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			if strings.Contains(sql, "SELECT id, name") {
+				return fakeRow{scanFunc: func(dest ...any) error {
+					return assignMonitorScan(dest, model.Monitor{
+						ID:              monitorID,
+						Name:            "API",
+						URL:             "https://example.com",
+						IntervalSeconds: 60,
+						TimeoutSeconds:  5,
+						CurrentStatus:   model.StatusUnknown,
+						NextCheckAt:     now,
+						CreatedAt:       now,
+						UpdatedAt:       now,
+					})
+				}}
+			}
+			if strings.Contains(sql, "INSERT INTO check_results") {
+				return fakeRow{scanFunc: func(dest ...any) error {
+					*dest[0].(*uuid.UUID) = args[0].(uuid.UUID)
+					*dest[1].(*uuid.UUID) = args[1].(uuid.UUID)
+					*dest[2].(*time.Time) = args[2].(time.Time)
+					*dest[3].(*bool) = args[3].(bool)
+					*dest[4].(**int) = args[4].(*int)
+					*dest[5].(*int64) = args[5].(int64)
+					*dest[6].(**string) = args[6].(*string)
+					return nil
+				}}
+			}
+			if strings.Contains(sql, "UPDATE monitors") {
+				return fakeRow{scanFunc: func(dest ...any) error {
+					return assignMonitorScan(dest, model.Monitor{
+						ID:                  monitorID,
+						Name:                "API",
+						URL:                 "https://example.com",
+						IntervalSeconds:     60,
+						TimeoutSeconds:      5,
+						CurrentStatus:       model.Status(args[1].(string)),
+						ConsecutiveFailures: args[2].(int),
+						LastCheckedAt:       args[3].(*time.Time),
+						LastSuccessAt:       args[4].(*time.Time),
+						NextCheckAt:         args[5].(time.Time),
+						CreatedAt:           now,
+						UpdatedAt:           args[6].(time.Time),
+					})
+				}}
+			}
+			t.Fatalf("unexpected SQL: %s", sql)
+			return nil
+		},
+	}
+
+	_, err := s.recordCheckResultTx(context.Background(), tx, RecordCheckParams{
+		MonitorID:   monitorID,
+		CheckedAt:   now,
+		CompletedAt: now.Add(20 * time.Millisecond),
+		Success:     true,
+		LatencyMs:   20,
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "commit failed") {
+		t.Fatalf("expected commit error, got %v", err)
+	}
+	if tx.commitCount != 1 {
+		t.Errorf("expected 1 commit attempt, got %d", tx.commitCount)
+	}
+	if tx.rollbackCnt != 1 {
+		t.Errorf("expected 1 rollback after commit failure, got %d", tx.rollbackCnt)
+	}
+}
+
+func TestRecordCheckResultTx_ParameterizedSQLAndCommit(t *testing.T) {
+	s := New(nil)
+	monitorID := uuid.New()
+	checkedAt := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+	completedAt := checkedAt.Add(350 * time.Millisecond)
+	statusCode := 200
+
+	tx := &fakeCheckTx{
+		queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			if strings.Contains(sql, "SELECT id, name") {
+				return fakeRow{scanFunc: func(dest ...any) error {
+					return assignMonitorScan(dest, model.Monitor{
+						ID:                  monitorID,
+						Name:                "API",
+						URL:                 "https://example.com",
+						IntervalSeconds:     90,
+						TimeoutSeconds:      5,
+						CurrentStatus:       model.StatusDown,
+						ConsecutiveFailures: 3,
+						NextCheckAt:         checkedAt,
+						CreatedAt:           checkedAt.Add(-5 * time.Minute),
+						UpdatedAt:           checkedAt.Add(-time.Minute),
+					})
+				}}
+			}
+			if strings.Contains(sql, "INSERT INTO check_results") {
+				return fakeRow{scanFunc: func(dest ...any) error {
+					*dest[0].(*uuid.UUID) = args[0].(uuid.UUID)
+					*dest[1].(*uuid.UUID) = args[1].(uuid.UUID)
+					*dest[2].(*time.Time) = args[2].(time.Time)
+					*dest[3].(*bool) = args[3].(bool)
+					*dest[4].(**int) = args[4].(*int)
+					*dest[5].(*int64) = args[5].(int64)
+					*dest[6].(**string) = args[6].(*string)
+					return nil
+				}}
+			}
+			if strings.Contains(sql, "UPDATE monitors") {
+				return fakeRow{scanFunc: func(dest ...any) error {
+					return assignMonitorScan(dest, model.Monitor{
+						ID:                  monitorID,
+						Name:                "API",
+						URL:                 "https://example.com",
+						IntervalSeconds:     90,
+						TimeoutSeconds:      5,
+						CurrentStatus:       model.Status(args[1].(string)),
+						ConsecutiveFailures: args[2].(int),
+						LastCheckedAt:       args[3].(*time.Time),
+						LastSuccessAt:       args[4].(*time.Time),
+						NextCheckAt:         args[5].(time.Time),
+						CreatedAt:           checkedAt.Add(-5 * time.Minute),
+						UpdatedAt:           args[6].(time.Time),
+					})
+				}}
+			}
+			t.Fatalf("unexpected SQL: %s", sql)
+			return nil
+		},
+	}
+
+	out, err := s.recordCheckResultTx(context.Background(), tx, RecordCheckParams{
+		MonitorID:   monitorID,
+		CheckedAt:   checkedAt,
+		CompletedAt: completedAt,
+		Success:     true,
+		HTTPStatus:  &statusCode,
+		LatencyMs:   350,
+	}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if tx.commitCount != 1 {
+		t.Errorf("expected 1 commit, got %d", tx.commitCount)
+	}
+	if tx.rollbackCnt != 0 {
+		t.Errorf("expected 0 rollbacks on commit, got %d", tx.rollbackCnt)
+	}
+	if out.Monitor.CurrentStatus != model.StatusUp {
+		t.Errorf("expected status UP, got %q", out.Monitor.CurrentStatus)
+	}
+	if out.Monitor.ConsecutiveFailures != 0 {
+		t.Errorf("expected consecutive_failures 0, got %d", out.Monitor.ConsecutiveFailures)
+	}
+	if out.Monitor.LastCheckedAt == nil || !out.Monitor.LastCheckedAt.Equal(checkedAt) {
+		t.Errorf("expected last_checked_at %v, got %v", checkedAt, out.Monitor.LastCheckedAt)
+	}
+	if out.Monitor.LastSuccessAt == nil || !out.Monitor.LastSuccessAt.Equal(checkedAt) {
+		t.Errorf("expected last_success_at %v, got %v", checkedAt, out.Monitor.LastSuccessAt)
+	}
+	wantNext := completedAt.Add(90 * time.Second)
+	if !out.Monitor.NextCheckAt.Equal(wantNext) {
+		t.Errorf("expected next_check_at %v, got %v", wantNext, out.Monitor.NextCheckAt)
+	}
+	if out.CheckResult.MonitorID != monitorID || !out.CheckResult.Success || out.CheckResult.LatencyMs != 350 {
+		t.Errorf("unexpected check result persisted: %+v", out.CheckResult)
+	}
+}
