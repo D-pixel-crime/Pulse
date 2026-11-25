@@ -431,3 +431,305 @@ func TestRecordCheckResultTx_ParameterizedSQLAndCommit(t *testing.T) {
 		t.Errorf("unexpected check result persisted: %+v", out.CheckResult)
 	}
 }
+
+type fakeRows struct {
+	pgx.Rows
+	rows      [][]any
+	idx       int
+	closed    bool
+	err       error
+	scanError error
+}
+
+func (r *fakeRows) Close()     { r.closed = true }
+func (r *fakeRows) Err() error { return r.err }
+
+func (r *fakeRows) Next() bool {
+	if r.idx >= len(r.rows) {
+		return false
+	}
+	r.idx++
+	return true
+}
+
+func (r *fakeRows) Scan(dest ...any) error {
+	if r.scanError != nil {
+		return r.scanError
+	}
+	row := r.rows[r.idx-1]
+	*dest[0].(*uuid.UUID) = row[0].(uuid.UUID)
+	*dest[1].(*uuid.UUID) = row[1].(uuid.UUID)
+	*dest[2].(*time.Time) = row[2].(time.Time)
+	*dest[3].(*bool) = row[3].(bool)
+	*dest[4].(**int) = row[4].(*int)
+	*dest[5].(*int64) = row[5].(int64)
+	*dest[6].(**string) = row[6].(*string)
+	return nil
+}
+
+type fakeQuerier struct {
+	queryRowFunc func(ctx context.Context, sql string, args ...any) pgx.Row
+	queryFunc    func(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	calls        []fakeTxCall
+}
+
+func (q *fakeQuerier) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	q.calls = append(q.calls, fakeTxCall{sql: sql, args: args})
+	return q.queryRowFunc(ctx, sql, args...)
+}
+
+func (q *fakeQuerier) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	q.calls = append(q.calls, fakeTxCall{sql: sql, args: args})
+	return q.queryFunc(ctx, sql, args...)
+}
+
+func TestListChecks_NilAndBoundsValidation(t *testing.T) {
+	var nilStore *Store
+	if _, err := nilStore.ListChecks(context.Background(), uuid.New(), 50); err == nil {
+		t.Fatal("expected error for nil store")
+	}
+
+	s := New(nil)
+	if _, err := s.ListChecks(context.Background(), uuid.New(), 50); err == nil {
+		t.Fatal("expected error for nil pool")
+	}
+
+	q := &fakeQuerier{}
+	for _, invalidLimit := range []int{0, -1, 201} {
+		if _, err := s.listChecksWithQuerier(context.Background(), q, uuid.New(), invalidLimit); err == nil {
+			t.Errorf("expected error for invalid limit %d", invalidLimit)
+		}
+	}
+	if len(q.calls) != 0 {
+		t.Errorf("expected no SQL calls for invalid limits, got %d", len(q.calls))
+	}
+}
+
+func TestListChecksWithQuerier_NotFoundEmptyAndOrdering(t *testing.T) {
+	s := New(nil)
+	monitorID := uuid.New()
+
+	t.Run("unknown monitor returns ErrNotFound", func(t *testing.T) {
+		q := &fakeQuerier{
+			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+				return fakeRow{scanFunc: func(dest ...any) error { return pgx.ErrNoRows }}
+			},
+		}
+
+		_, err := s.listChecksWithQuerier(context.Background(), q, monitorID, 50)
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("expected ErrNotFound, got %v", err)
+		}
+		if len(q.calls) != 1 {
+			t.Errorf("expected only existence check query, got %d calls", len(q.calls))
+		}
+	})
+
+	t.Run("existing monitor with empty history returns non-nil empty slice", func(t *testing.T) {
+		q := &fakeQuerier{
+			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+				return fakeRow{scanFunc: func(dest ...any) error {
+					*dest[0].(*int) = 1
+					return nil
+				}}
+			},
+			queryFunc: func(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+				if !strings.Contains(sql, "ORDER BY checked_at DESC") || !strings.Contains(sql, "LIMIT $2") {
+					t.Errorf("unexpected SQL ordering/limit: %s", sql)
+				}
+				if args[0].(uuid.UUID) != monitorID || args[1].(int) != 50 {
+					t.Errorf("unexpected args: %v", args)
+				}
+				return &fakeRows{}, nil
+			},
+		}
+
+		checks, err := s.listChecksWithQuerier(context.Background(), q, monitorID, 50)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if checks == nil || len(checks) != 0 {
+			t.Errorf("expected non-nil empty slice, got %v", checks)
+		}
+	})
+
+	t.Run("scans rows and preserves order", func(t *testing.T) {
+		t2 := time.Date(2026, 11, 25, 12, 5, 0, 0, time.UTC)
+		t1 := time.Date(2026, 11, 25, 12, 4, 0, 0, time.UTC)
+		status200 := 200
+		status503 := 503
+		err503 := "HTTP status 503 Service Unavailable"
+		id2 := uuid.New()
+		id1 := uuid.New()
+
+		rows := &fakeRows{
+			rows: [][]any{
+				{id2, monitorID, t2, true, &status200, int64(42), (*string)(nil)},
+				{id1, monitorID, t1, false, &status503, int64(85), &err503},
+			},
+		}
+
+		q := &fakeQuerier{
+			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+				return fakeRow{scanFunc: func(dest ...any) error {
+					*dest[0].(*int) = 1
+					return nil
+				}}
+			},
+			queryFunc: func(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+				if args[1].(int) != 2 {
+					t.Errorf("expected limit 2, got %v", args[1])
+				}
+				return rows, nil
+			},
+		}
+
+		checks, err := s.listChecksWithQuerier(context.Background(), q, monitorID, 2)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !rows.closed {
+			t.Errorf("expected rows to be closed")
+		}
+		if len(checks) != 2 {
+			t.Fatalf("expected 2 checks, got %d", len(checks))
+		}
+		if checks[0].ID != id2 || !checks[0].Success || checks[0].ErrorMessage != nil {
+			t.Errorf("unexpected first check: %+v", checks[0])
+		}
+		if checks[1].ID != id1 || checks[1].Success || checks[1].ErrorMessage == nil || *checks[1].ErrorMessage != err503 {
+			t.Errorf("unexpected second check: %+v", checks[1])
+		}
+	})
+}
+
+func TestGetMonitorStats_NilAndBoundsValidation(t *testing.T) {
+	var nilStore *Store
+	if _, err := nilStore.GetMonitorStats(context.Background(), uuid.New(), 24); err == nil {
+		t.Fatal("expected error for nil store")
+	}
+
+	s := New(nil)
+	if _, err := s.GetMonitorStats(context.Background(), uuid.New(), 24); err == nil {
+		t.Fatal("expected error for nil pool")
+	}
+
+	q := &fakeQuerier{}
+	for _, invalidHours := range []int{0, -1, 721} {
+		if _, err := s.getMonitorStatsWithQuerier(context.Background(), q, uuid.New(), invalidHours); err == nil {
+			t.Errorf("expected error for invalid hours %d", invalidHours)
+		}
+	}
+	if len(q.calls) != 0 {
+		t.Errorf("expected no SQL calls for invalid hours, got %d", len(q.calls))
+	}
+}
+
+func TestGetMonitorStatsWithQuerier_Cases(t *testing.T) {
+	s := New(nil)
+	monitorID := uuid.New()
+
+	t.Run("unknown monitor returns ErrNotFound", func(t *testing.T) {
+		q := &fakeQuerier{
+			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+				return fakeRow{scanFunc: func(dest ...any) error { return pgx.ErrNoRows }}
+			},
+		}
+
+		_, err := s.getMonitorStatsWithQuerier(context.Background(), q, monitorID, 24)
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("expected ErrNotFound, got %v", err)
+		}
+	})
+
+	t.Run("empty window returns nil availability and nil average_latency_ms", func(t *testing.T) {
+		q := &fakeQuerier{
+			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+				if !strings.Contains(sql, "make_interval(hours => $2::integer)") {
+					t.Errorf("expected bounded parameterized interval SQL, got: %s", sql)
+				}
+				if args[0].(uuid.UUID) != monitorID || args[1].(int) != 24 {
+					t.Errorf("unexpected args: %v", args)
+				}
+				return fakeRow{scanFunc: func(dest ...any) error {
+					*dest[0].(*uuid.UUID) = monitorID
+					*dest[1].(*int64) = 0
+					*dest[2].(*int64) = 0
+					*dest[3].(*int64) = 0
+					*dest[4].(**float64) = nil
+					return nil
+				}}
+			},
+		}
+
+		stats, err := s.getMonitorStatsWithQuerier(context.Background(), q, monitorID, 24)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if stats.TotalChecks != 0 || stats.SuccessfulChecks != 0 || stats.FailedChecks != 0 {
+			t.Errorf("expected zero counts, got %+v", stats)
+		}
+		if stats.Availability != nil {
+			t.Errorf("expected nil availability for empty window, got %v", *stats.Availability)
+		}
+		if stats.AverageLatencyMs != nil {
+			t.Errorf("expected nil average_latency_ms for empty window, got %v", *stats.AverageLatencyMs)
+		}
+	})
+
+	t.Run("all failed checks returns 0 availability and nil average_latency_ms", func(t *testing.T) {
+		q := &fakeQuerier{
+			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+				return fakeRow{scanFunc: func(dest ...any) error {
+					*dest[0].(*uuid.UUID) = monitorID
+					*dest[1].(*int64) = 3
+					*dest[2].(*int64) = 0
+					*dest[3].(*int64) = 3
+					*dest[4].(**float64) = nil
+					return nil
+				}}
+			},
+		}
+
+		stats, err := s.getMonitorStatsWithQuerier(context.Background(), q, monitorID, 12)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if stats.WindowHours != 12 {
+			t.Errorf("expected window_hours 12, got %d", stats.WindowHours)
+		}
+		if stats.Availability == nil || *stats.Availability != 0 {
+			t.Errorf("expected availability 0.0, got %v", stats.Availability)
+		}
+		if stats.AverageLatencyMs != nil {
+			t.Errorf("expected nil average_latency_ms when successful_checks == 0, got %v", *stats.AverageLatencyMs)
+		}
+	})
+
+	t.Run("mixed results computes availability accurately", func(t *testing.T) {
+		avg := 134.5
+		q := &fakeQuerier{
+			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+				return fakeRow{scanFunc: func(dest ...any) error {
+					*dest[0].(*uuid.UUID) = monitorID
+					*dest[1].(*int64) = 4
+					*dest[2].(*int64) = 3
+					*dest[3].(*int64) = 1
+					*dest[4].(**float64) = &avg
+					return nil
+				}}
+			},
+		}
+
+		stats, err := s.getMonitorStatsWithQuerier(context.Background(), q, monitorID, 48)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if stats.Availability == nil || *stats.Availability != 75.0 {
+			t.Errorf("expected availability 75.0, got %v", stats.Availability)
+		}
+		if stats.AverageLatencyMs == nil || *stats.AverageLatencyMs != 134.5 {
+			t.Errorf("expected average_latency_ms 134.5, got %v", stats.AverageLatencyMs)
+		}
+	})
+}

@@ -10,6 +10,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -20,12 +21,14 @@ import (
 	"pulse/internal/store"
 )
 
-// MonitorRepository defines the data access contract required by monitor CRUD handlers.
+// MonitorRepository defines the data access contract required by monitor CRUD, history, and stats handlers.
 type MonitorRepository interface {
 	Create(ctx context.Context, m *model.Monitor) (*model.Monitor, error)
 	GetByID(ctx context.Context, id uuid.UUID) (*model.Monitor, error)
 	List(ctx context.Context) ([]*model.Monitor, error)
 	Delete(ctx context.Context, id uuid.UUID) error
+	ListChecks(ctx context.Context, monitorID uuid.UUID, limit int) ([]*model.CheckResult, error)
+	GetMonitorStats(ctx context.Context, monitorID uuid.UUID, hours int) (*model.MonitorStats, error)
 }
 
 // CreateMonitorRequest represents the incoming JSON payload for registering a new monitor.
@@ -41,17 +44,26 @@ type ListMonitorsResponse struct {
 	Monitors []*model.Monitor `json:"monitors"`
 }
 
+// ListChecksResponse represents the response containing recent check history for a monitor.
+type ListChecksResponse struct {
+	MonitorID uuid.UUID            `json:"monitor_id"`
+	Limit     int                  `json:"limit"`
+	Checks    []*model.CheckResult `json:"checks"`
+}
+
 const (
 	// maxRequestBodySize limits request bodies to 1 MB to protect against memory exhaustion.
 	maxRequestBodySize = 1 << 20
 )
 
-// RegisterMonitorRoutes registers the REST endpoints for monitor CRUD operations.
+// RegisterMonitorRoutes registers the REST endpoints for monitor CRUD, check history, and stats operations.
 func RegisterMonitorRoutes(mux *http.ServeMux, repo MonitorRepository, logger *slog.Logger) {
 	mux.HandleFunc("POST /api/v1/monitors", CreateMonitorHandler(repo, logger))
 	mux.HandleFunc("GET /api/v1/monitors", ListMonitorsHandler(repo, logger))
 	mux.HandleFunc("GET /api/v1/monitors/{id}", GetMonitorHandler(repo, logger))
 	mux.HandleFunc("DELETE /api/v1/monitors/{id}", DeleteMonitorHandler(repo, logger))
+	mux.HandleFunc("GET /api/v1/monitors/{id}/checks", ListMonitorChecksHandler(repo, logger))
+	mux.HandleFunc("GET /api/v1/monitors/{id}/stats", GetMonitorStatsHandler(repo, logger))
 }
 
 // CreateMonitorHandler handles POST /api/v1/monitors to register a new monitor.
@@ -275,5 +287,118 @@ func DeleteMonitorHandler(repo MonitorRepository, logger *slog.Logger) http.Hand
 		}
 
 		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func parseMonitorID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid monitor id: must be a valid UUID")
+		return uuid.Nil, false
+	}
+	return id, true
+}
+
+func parseBoundedIntQueryParam(r *http.Request, name string, defaultVal, minVal, maxVal int) (int, error) {
+	q := r.URL.Query()
+	if !q.Has(name) {
+		return defaultVal, nil
+	}
+
+	vals := q[name]
+	if len(vals) != 1 {
+		return 0, fmt.Errorf("invalid query parameter: %s must be between %d and %d", name, minVal, maxVal)
+	}
+
+	val, err := strconv.Atoi(vals[0])
+	if err != nil || val < minVal || val > maxVal {
+		return 0, fmt.Errorf("invalid query parameter: %s must be between %d and %d", name, minVal, maxVal)
+	}
+	return val, nil
+}
+
+// ListMonitorChecksHandler handles GET /api/v1/monitors/{id}/checks to retrieve recent check history newest first.
+func ListMonitorChecksHandler(repo MonitorRepository, logger *slog.Logger) http.HandlerFunc {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, ok := parseMonitorID(w, r)
+		if !ok {
+			return
+		}
+
+		limit, err := parseBoundedIntQueryParam(
+			r,
+			"limit",
+			model.DefaultCheckHistoryLimit,
+			model.MinCheckHistoryLimit,
+			model.MaxCheckHistoryLimit,
+		)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		checks, err := repo.ListChecks(r.Context(), id, limit)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "monitor not found")
+				return
+			}
+			logger.Error("failed to list monitor checks", slog.String("id", id.String()), slog.String("error", err.Error()))
+			writeError(w, http.StatusInternalServerError, "failed to list monitor checks")
+			return
+		}
+
+		if checks == nil {
+			checks = make([]*model.CheckResult, 0)
+		}
+
+		writeJSON(w, http.StatusOK, ListChecksResponse{
+			MonitorID: id,
+			Limit:     limit,
+			Checks:    checks,
+		})
+	}
+}
+
+// GetMonitorStatsHandler handles GET /api/v1/monitors/{id}/stats to compute uptime and latency statistics.
+func GetMonitorStatsHandler(repo MonitorRepository, logger *slog.Logger) http.HandlerFunc {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, ok := parseMonitorID(w, r)
+		if !ok {
+			return
+		}
+
+		hours, err := parseBoundedIntQueryParam(
+			r,
+			"hours",
+			model.DefaultStatsWindowHours,
+			model.MinStatsWindowHours,
+			model.MaxStatsWindowHours,
+		)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		stats, err := repo.GetMonitorStats(r.Context(), id, hours)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "monitor not found")
+				return
+			}
+			logger.Error("failed to get monitor stats", slog.String("id", id.String()), slog.String("error", err.Error()))
+			writeError(w, http.StatusInternalServerError, "failed to get monitor stats")
+			return
+		}
+
+		writeJSON(w, http.StatusOK, stats)
 	}
 }

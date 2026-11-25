@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -22,18 +24,24 @@ import (
 
 // fakeMonitorRepository implements api.MonitorRepository in-memory for testing.
 type fakeMonitorRepository struct {
-	mu          sync.Mutex
-	monitors    map[uuid.UUID]*model.Monitor
-	createCalls int
-	createErr   error
-	getErr      error
-	listErr     error
-	deleteErr   error
+	mu              sync.Mutex
+	monitors        map[uuid.UUID]*model.Monitor
+	checks          map[uuid.UUID][]*model.CheckResult
+	createCalls     int
+	listChecksCalls int
+	statsCalls      int
+	createErr       error
+	getErr          error
+	listErr         error
+	deleteErr       error
+	listChecksErr   error
+	statsErr        error
 }
 
 func newFakeMonitorRepo() *fakeMonitorRepository {
 	return &fakeMonitorRepository{
 		monitors: make(map[uuid.UUID]*model.Monitor),
+		checks:   make(map[uuid.UUID][]*model.CheckResult),
 	}
 }
 
@@ -112,7 +120,106 @@ func (f *fakeMonitorRepository) Delete(ctx context.Context, id uuid.UUID) error 
 		return store.ErrNotFound
 	}
 	delete(f.monitors, id)
+	delete(f.checks, id)
 	return nil
+}
+
+func (f *fakeMonitorRepository) AddCheck(c *model.CheckResult) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cp := *c
+	f.checks[c.MonitorID] = append(f.checks[c.MonitorID], &cp)
+}
+
+func (f *fakeMonitorRepository) ListChecksCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.listChecksCalls
+}
+
+func (f *fakeMonitorRepository) StatsCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.statsCalls
+}
+
+func (f *fakeMonitorRepository) ListChecks(ctx context.Context, monitorID uuid.UUID, limit int) ([]*model.CheckResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.listChecksCalls++
+
+	if f.listChecksErr != nil {
+		return nil, f.listChecksErr
+	}
+
+	if _, ok := f.monitors[monitorID]; !ok {
+		return nil, store.ErrNotFound
+	}
+
+	existing := f.checks[monitorID]
+	sorted := make([]*model.CheckResult, len(existing))
+	for i, c := range existing {
+		cp := *c
+		sorted[i] = &cp
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		if !sorted[i].CheckedAt.Equal(sorted[j].CheckedAt) {
+			return sorted[i].CheckedAt.After(sorted[j].CheckedAt)
+		}
+		return sorted[i].ID.String() > sorted[j].ID.String()
+	})
+
+	if limit < len(sorted) {
+		sorted = sorted[:limit]
+	}
+	return sorted, nil
+}
+
+func (f *fakeMonitorRepository) GetMonitorStats(ctx context.Context, monitorID uuid.UUID, hours int) (*model.MonitorStats, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.statsCalls++
+
+	if f.statsErr != nil {
+		return nil, f.statsErr
+	}
+
+	if _, ok := f.monitors[monitorID]; !ok {
+		return nil, store.ErrNotFound
+	}
+
+	cutoff := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
+	stats := &model.MonitorStats{
+		MonitorID:   monitorID,
+		WindowHours: hours,
+	}
+
+	var latencySum int64
+	for _, c := range f.checks[monitorID] {
+		if c.CheckedAt.Before(cutoff) {
+			continue
+		}
+		stats.TotalChecks++
+		if c.Success {
+			stats.SuccessfulChecks++
+			latencySum += c.LatencyMs
+		} else {
+			stats.FailedChecks++
+		}
+	}
+
+	if stats.TotalChecks > 0 {
+		avail := (float64(stats.SuccessfulChecks) / float64(stats.TotalChecks)) * 100.0
+		stats.Availability = &avail
+	}
+	if stats.SuccessfulChecks > 0 {
+		avg := float64(latencySum) / float64(stats.SuccessfulChecks)
+		stats.AverageLatencyMs = &avg
+	}
+
+	return stats, nil
 }
 
 func setupMonitorTestRouter(repo api.MonitorRepository) http.Handler {
@@ -834,5 +941,533 @@ func TestMonitorRoutes_MethodNotAllowed(t *testing.T) {
 				t.Errorf("expected 'method not allowed', got %q", errRes.Error)
 			}
 		})
+	}
+}
+
+func TestListMonitorChecks_SuccessOrderingAndLimits(t *testing.T) {
+	t.Run("empty history returns 200 with empty checks array and default limit 50", func(t *testing.T) {
+		repo := newFakeMonitorRepo()
+		m, err := repo.Create(context.Background(), &model.Monitor{
+			Name:            "Empty History Monitor",
+			URL:             "https://example.com/health",
+			IntervalSeconds: 60,
+			TimeoutSeconds:  5,
+		})
+		if err != nil {
+			t.Fatalf("failed to seed monitor: %v", err)
+		}
+
+		router := setupMonitorTestRouter(repo)
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/monitors/"+m.ID.String()+"/checks", nil)
+		rec := httptest.NewRecorder()
+
+		router.ServeHTTP(rec, req)
+		res := rec.Result()
+		defer res.Body.Close()
+
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("expected status 200 OK, got %d", res.StatusCode)
+		}
+
+		rawBody, _ := io.ReadAll(res.Body)
+		var raw map[string]any
+		if err := json.Unmarshal(rawBody, &raw); err != nil {
+			t.Fatalf("failed to decode JSON: %v", err)
+		}
+		if checksVal, ok := raw["checks"]; !ok || checksVal == nil {
+			t.Fatalf("expected non-null checks array in JSON, got %s", string(rawBody))
+		}
+
+		var out api.ListChecksResponse
+		if err := json.Unmarshal(rawBody, &out); err != nil {
+			t.Fatalf("failed to decode ListChecksResponse: %v", err)
+		}
+		if out.MonitorID != m.ID {
+			t.Errorf("expected monitor_id %v, got %v", m.ID, out.MonitorID)
+		}
+		if out.Limit != 50 {
+			t.Errorf("expected default limit 50, got %d", out.Limit)
+		}
+		if len(out.Checks) != 0 {
+			t.Errorf("expected 0 checks, got %d", len(out.Checks))
+		}
+	})
+
+	t.Run("orders newest first and enforces default 50 and explicit limits", func(t *testing.T) {
+		repo := newFakeMonitorRepo()
+		m, err := repo.Create(context.Background(), &model.Monitor{
+			Name:            "Ordered Checks Monitor",
+			URL:             "https://example.com/checks",
+			IntervalSeconds: 60,
+			TimeoutSeconds:  5,
+		})
+		if err != nil {
+			t.Fatalf("failed to seed monitor: %v", err)
+		}
+
+		base := time.Now().UTC().Add(-2 * time.Hour)
+		status200 := 200
+		status503 := 503
+		err503 := "HTTP status 503 Service Unavailable"
+
+		var ids []uuid.UUID
+		for i := 0; i < 60; i++ {
+			id := uuid.New()
+			ids = append(ids, id)
+			success := i%2 == 0
+			httpStatus := &status200
+			var errMsg *string
+			if !success {
+				httpStatus = &status503
+				errMsg = &err503
+			}
+			repo.AddCheck(&model.CheckResult{
+				ID:           id,
+				MonitorID:    m.ID,
+				CheckedAt:    base.Add(time.Duration(i) * time.Minute),
+				Success:      success,
+				HTTPStatus:   httpStatus,
+				LatencyMs:    int64(100 + i),
+				ErrorMessage: errMsg,
+			})
+		}
+
+		router := setupMonitorTestRouter(repo)
+
+		// Default limit = 50 -> returns 50 newest checks (indices 59 down to 10)
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/monitors/"+m.ID.String()+"/checks", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		res := rec.Result()
+		defer res.Body.Close()
+
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("expected status 200 OK, got %d", res.StatusCode)
+		}
+		var defaultOut api.ListChecksResponse
+		if err := json.NewDecoder(res.Body).Decode(&defaultOut); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if defaultOut.Limit != 50 || len(defaultOut.Checks) != 50 {
+			t.Fatalf("expected limit 50 and 50 checks, got limit=%d len=%d", defaultOut.Limit, len(defaultOut.Checks))
+		}
+		if defaultOut.Checks[0].ID != ids[59] || defaultOut.Checks[49].ID != ids[10] {
+			t.Errorf("unexpected newest-first ordering: first=%v last=%v", defaultOut.Checks[0].ID, defaultOut.Checks[49].ID)
+		}
+
+		// Explicit limit = 3 -> returns 3 newest checks
+		req2 := httptest.NewRequest(http.MethodGet, "/api/v1/monitors/"+m.ID.String()+"/checks?limit=3", nil)
+		rec2 := httptest.NewRecorder()
+		router.ServeHTTP(rec2, req2)
+		res2 := rec2.Result()
+		defer res2.Body.Close()
+
+		if res2.StatusCode != http.StatusOK {
+			t.Fatalf("expected status 200 OK, got %d", res2.StatusCode)
+		}
+		var limitOut api.ListChecksResponse
+		if err := json.NewDecoder(res2.Body).Decode(&limitOut); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if limitOut.Limit != 3 || len(limitOut.Checks) != 3 {
+			t.Fatalf("expected limit 3 and 3 checks, got limit=%d len=%d", limitOut.Limit, len(limitOut.Checks))
+		}
+		for i := 0; i < 3; i++ {
+			if limitOut.Checks[i].ID != ids[59-i] {
+				t.Errorf("checks[%d].ID = %v, want %v", i, limitOut.Checks[i].ID, ids[59-i])
+			}
+		}
+
+		// Explicit boundary limit = 200 is accepted
+		reqMax := httptest.NewRequest(http.MethodGet, "/api/v1/monitors/"+m.ID.String()+"/checks?limit=200", nil)
+		recMax := httptest.NewRecorder()
+		router.ServeHTTP(recMax, reqMax)
+		resMax := recMax.Result()
+		defer resMax.Body.Close()
+		if resMax.StatusCode != http.StatusOK {
+			t.Fatalf("expected status 200 OK for limit=200, got %d", resMax.StatusCode)
+		}
+	})
+}
+
+func TestListMonitorChecks_ErrorsAndValidation(t *testing.T) {
+	t.Run("unknown monitor returns 404", func(t *testing.T) {
+		repo := newFakeMonitorRepo()
+		router := setupMonitorTestRouter(repo)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/monitors/"+uuid.New().String()+"/checks", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		res := rec.Result()
+		defer res.Body.Close()
+
+		if res.StatusCode != http.StatusNotFound {
+			t.Fatalf("expected 404 Not Found, got %d", res.StatusCode)
+		}
+		var errRes api.ErrorResponse
+		_ = json.NewDecoder(res.Body).Decode(&errRes)
+		if errRes.Error != "monitor not found" {
+			t.Errorf("expected 'monitor not found', got %q", errRes.Error)
+		}
+	})
+
+	t.Run("invalid UUID returns 400", func(t *testing.T) {
+		repo := newFakeMonitorRepo()
+		router := setupMonitorTestRouter(repo)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/monitors/not-a-uuid/checks", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		res := rec.Result()
+		defer res.Body.Close()
+
+		if res.StatusCode != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request, got %d", res.StatusCode)
+		}
+		if repo.ListChecksCalls() != 0 {
+			t.Errorf("expected repo.ListChecks not called on invalid UUID")
+		}
+	})
+
+	invalidLimits := []string{
+		"limit=0",
+		"limit=-1",
+		"limit=201",
+		"limit=abc",
+		"limit=",
+		"limit=10&limit=20",
+	}
+	for _, query := range invalidLimits {
+		t.Run("invalid_"+query, func(t *testing.T) {
+			repo := newFakeMonitorRepo()
+			m, _ := repo.Create(context.Background(), &model.Monitor{
+				Name: "M", URL: "https://example.com", IntervalSeconds: 60, TimeoutSeconds: 5,
+			})
+			router := setupMonitorTestRouter(repo)
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/monitors/"+m.ID.String()+"/checks?"+query, nil)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			res := rec.Result()
+			defer res.Body.Close()
+
+			if res.StatusCode != http.StatusBadRequest {
+				t.Fatalf("expected 400 Bad Request for %s, got %d", query, res.StatusCode)
+			}
+			var errRes api.ErrorResponse
+			_ = json.NewDecoder(res.Body).Decode(&errRes)
+			if errRes.Error != "invalid query parameter: limit must be between 1 and 200" {
+				t.Errorf("unexpected error message: %q", errRes.Error)
+			}
+			if repo.ListChecksCalls() != 0 {
+				t.Errorf("expected repo.ListChecks not called for invalid limit")
+			}
+		})
+	}
+
+	t.Run("repository internal error does not leak SQL details", func(t *testing.T) {
+		repo := newFakeMonitorRepo()
+		repo.listChecksErr = errors.New("pq: relation check_results error")
+		router := setupMonitorTestRouter(repo)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/monitors/"+uuid.New().String()+"/checks", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		res := rec.Result()
+		defer res.Body.Close()
+
+		if res.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("expected 500, got %d", res.StatusCode)
+		}
+		var errRes api.ErrorResponse
+		_ = json.NewDecoder(res.Body).Decode(&errRes)
+		if strings.Contains(errRes.Error, "pq:") {
+			t.Errorf("leaked internal error: %q", errRes.Error)
+		}
+	})
+}
+
+func TestGetMonitorStats_SuccessAndMath(t *testing.T) {
+	t.Run("empty window returns null availability and null average_latency_ms", func(t *testing.T) {
+		repo := newFakeMonitorRepo()
+		m, _ := repo.Create(context.Background(), &model.Monitor{
+			Name: "Empty Stats Monitor", URL: "https://example.com", IntervalSeconds: 60, TimeoutSeconds: 5,
+		})
+		router := setupMonitorTestRouter(repo)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/monitors/"+m.ID.String()+"/stats", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		res := rec.Result()
+		defer res.Body.Close()
+
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", res.StatusCode)
+		}
+
+		rawBytes, _ := io.ReadAll(res.Body)
+		var rawMap map[string]any
+		if err := json.Unmarshal(rawBytes, &rawMap); err != nil {
+			t.Fatalf("failed to unmarshal raw JSON: %v", err)
+		}
+		if v, exists := rawMap["availability"]; !exists || v != nil {
+			t.Errorf("expected availability key to be literal null, got exists=%v val=%v", exists, v)
+		}
+		if v, exists := rawMap["average_latency_ms"]; !exists || v != nil {
+			t.Errorf("expected average_latency_ms key to be literal null, got exists=%v val=%v", exists, v)
+		}
+
+		var stats model.MonitorStats
+		if err := json.Unmarshal(rawBytes, &stats); err != nil {
+			t.Fatalf("failed to decode MonitorStats: %v", err)
+		}
+		if stats.WindowHours != 24 || stats.TotalChecks != 0 || stats.SuccessfulChecks != 0 || stats.FailedChecks != 0 {
+			t.Errorf("unexpected empty stats: %+v", stats)
+		}
+	})
+
+	t.Run("all failed checks returns 0 availability and null average_latency_ms", func(t *testing.T) {
+		repo := newFakeMonitorRepo()
+		m, _ := repo.Create(context.Background(), &model.Monitor{
+			Name: "All Failed Monitor", URL: "https://example.com", IntervalSeconds: 60, TimeoutSeconds: 5,
+		})
+		now := time.Now().UTC()
+		status500 := 500
+		err500 := "HTTP status 500 Internal Server Error"
+		repo.AddCheck(&model.CheckResult{ID: uuid.New(), MonitorID: m.ID, CheckedAt: now.Add(-10 * time.Minute), Success: false, HTTPStatus: &status500, LatencyMs: 400, ErrorMessage: &err500})
+		repo.AddCheck(&model.CheckResult{ID: uuid.New(), MonitorID: m.ID, CheckedAt: now.Add(-5 * time.Minute), Success: false, HTTPStatus: &status500, LatencyMs: 600, ErrorMessage: &err500})
+
+		router := setupMonitorTestRouter(repo)
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/monitors/"+m.ID.String()+"/stats", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		res := rec.Result()
+		defer res.Body.Close()
+
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", res.StatusCode)
+		}
+
+		var stats model.MonitorStats
+		if err := json.NewDecoder(res.Body).Decode(&stats); err != nil {
+			t.Fatalf("failed to decode MonitorStats: %v", err)
+		}
+		if stats.TotalChecks != 2 || stats.SuccessfulChecks != 0 || stats.FailedChecks != 2 {
+			t.Errorf("unexpected counts: %+v", stats)
+		}
+		if stats.Availability == nil || *stats.Availability != 0 {
+			t.Errorf("expected availability 0, got %v", stats.Availability)
+		}
+		if stats.AverageLatencyMs != nil {
+			t.Errorf("expected nil average_latency_ms when no successful observations exist, got %v", *stats.AverageLatencyMs)
+		}
+	})
+
+	t.Run("mixed results and window filtering compute accurate math", func(t *testing.T) {
+		repo := newFakeMonitorRepo()
+		m, _ := repo.Create(context.Background(), &model.Monitor{
+			Name: "Mixed Stats Monitor", URL: "https://example.com", IntervalSeconds: 60, TimeoutSeconds: 5,
+		})
+		now := time.Now().UTC()
+		status200 := 200
+		status502 := 502
+		err502 := "HTTP status 502 Bad Gateway"
+
+		// Outside default 24h window (30h ago)
+		repo.AddCheck(&model.CheckResult{ID: uuid.New(), MonitorID: m.ID, CheckedAt: now.Add(-30 * time.Hour), Success: true, HTTPStatus: &status200, LatencyMs: 900})
+		// Inside 24h window, outside 2h window (5h ago)
+		repo.AddCheck(&model.CheckResult{ID: uuid.New(), MonitorID: m.ID, CheckedAt: now.Add(-5 * time.Hour), Success: false, HTTPStatus: &status502, LatencyMs: 3000, ErrorMessage: &err502})
+		// Inside 2h window: 2 successes (100, 169 -> avg 134.5), 1 failure (5000 excluded from avg latency)
+		repo.AddCheck(&model.CheckResult{ID: uuid.New(), MonitorID: m.ID, CheckedAt: now.Add(-30 * time.Minute), Success: true, HTTPStatus: &status200, LatencyMs: 100})
+		repo.AddCheck(&model.CheckResult{ID: uuid.New(), MonitorID: m.ID, CheckedAt: now.Add(-20 * time.Minute), Success: true, HTTPStatus: &status200, LatencyMs: 169})
+		repo.AddCheck(&model.CheckResult{ID: uuid.New(), MonitorID: m.ID, CheckedAt: now.Add(-10 * time.Minute), Success: false, HTTPStatus: &status502, LatencyMs: 5000, ErrorMessage: &err502})
+
+		router := setupMonitorTestRouter(repo)
+
+		// Default 24h window: 4 checks (2 success, 2 fail) -> 50.0% availability, 134.5ms avg latency
+		req24 := httptest.NewRequest(http.MethodGet, "/api/v1/monitors/"+m.ID.String()+"/stats", nil)
+		rec24 := httptest.NewRecorder()
+		router.ServeHTTP(rec24, req24)
+		res24 := rec24.Result()
+		defer res24.Body.Close()
+
+		if res24.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", res24.StatusCode)
+		}
+		var s24 model.MonitorStats
+		if err := json.NewDecoder(res24.Body).Decode(&s24); err != nil {
+			t.Fatalf("failed to decode 24h stats: %v", err)
+		}
+		if s24.WindowHours != 24 || s24.TotalChecks != 4 || s24.SuccessfulChecks != 2 || s24.FailedChecks != 2 {
+			t.Errorf("unexpected 24h stats: %+v", s24)
+		}
+		if s24.Availability == nil || *s24.Availability != 50.0 {
+			t.Errorf("expected 24h availability 50.0, got %v", s24.Availability)
+		}
+		if s24.AverageLatencyMs == nil || *s24.AverageLatencyMs != 134.5 {
+			t.Errorf("expected 24h average_latency_ms 134.5, got %v", s24.AverageLatencyMs)
+		}
+
+		// Custom 2h window: 3 checks (2 success, 1 fail) -> 66.666...% availability, 134.5ms avg latency
+		req2 := httptest.NewRequest(http.MethodGet, "/api/v1/monitors/"+m.ID.String()+"/stats?hours=2", nil)
+		rec2 := httptest.NewRecorder()
+		router.ServeHTTP(rec2, req2)
+		res2 := rec2.Result()
+		defer res2.Body.Close()
+
+		if res2.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", res2.StatusCode)
+		}
+		var s2 model.MonitorStats
+		if err := json.NewDecoder(res2.Body).Decode(&s2); err != nil {
+			t.Fatalf("failed to decode 2h stats: %v", err)
+		}
+		if s2.WindowHours != 2 || s2.TotalChecks != 3 || s2.SuccessfulChecks != 2 || s2.FailedChecks != 1 {
+			t.Errorf("unexpected 2h stats: %+v", s2)
+		}
+		wantAvail := (2.0 / 3.0) * 100.0
+		if s2.Availability == nil || math.Abs(*s2.Availability-wantAvail) > 1e-9 {
+			t.Errorf("expected 2h availability %v, got %v", wantAvail, s2.Availability)
+		}
+		if s2.AverageLatencyMs == nil || *s2.AverageLatencyMs != 134.5 {
+			t.Errorf("expected 2h average_latency_ms 134.5, got %v", s2.AverageLatencyMs)
+		}
+
+		// Custom max 720h window includes all 5 checks
+		req720 := httptest.NewRequest(http.MethodGet, "/api/v1/monitors/"+m.ID.String()+"/stats?hours=720", nil)
+		rec720 := httptest.NewRecorder()
+		router.ServeHTTP(rec720, req720)
+		res720 := rec720.Result()
+		defer res720.Body.Close()
+
+		if res720.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK for hours=720, got %d", res720.StatusCode)
+		}
+		var s720 model.MonitorStats
+		if err := json.NewDecoder(res720.Body).Decode(&s720); err != nil {
+			t.Fatalf("failed to decode 720h stats: %v", err)
+		}
+		if s720.TotalChecks != 5 || s720.SuccessfulChecks != 3 || s720.FailedChecks != 2 {
+			t.Errorf("unexpected 720h stats: %+v", s720)
+		}
+	})
+}
+
+func TestGetMonitorStats_ErrorsAndValidation(t *testing.T) {
+	t.Run("unknown monitor returns 404", func(t *testing.T) {
+		repo := newFakeMonitorRepo()
+		router := setupMonitorTestRouter(repo)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/monitors/"+uuid.New().String()+"/stats", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		res := rec.Result()
+		defer res.Body.Close()
+
+		if res.StatusCode != http.StatusNotFound {
+			t.Fatalf("expected 404 Not Found, got %d", res.StatusCode)
+		}
+		var errRes api.ErrorResponse
+		_ = json.NewDecoder(res.Body).Decode(&errRes)
+		if errRes.Error != "monitor not found" {
+			t.Errorf("expected 'monitor not found', got %q", errRes.Error)
+		}
+	})
+
+	t.Run("invalid UUID returns 400", func(t *testing.T) {
+		repo := newFakeMonitorRepo()
+		router := setupMonitorTestRouter(repo)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/monitors/bad-uuid/stats", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		res := rec.Result()
+		defer res.Body.Close()
+
+		if res.StatusCode != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request, got %d", res.StatusCode)
+		}
+		if repo.StatsCalls() != 0 {
+			t.Errorf("expected repo.GetMonitorStats not called on invalid UUID")
+		}
+	})
+
+	invalidHours := []string{
+		"hours=0",
+		"hours=-5",
+		"hours=721",
+		"hours=abc",
+		"hours=",
+		"hours=1&hours=2",
+	}
+	for _, query := range invalidHours {
+		t.Run("invalid_"+query, func(t *testing.T) {
+			repo := newFakeMonitorRepo()
+			m, _ := repo.Create(context.Background(), &model.Monitor{
+				Name: "M", URL: "https://example.com", IntervalSeconds: 60, TimeoutSeconds: 5,
+			})
+			router := setupMonitorTestRouter(repo)
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/monitors/"+m.ID.String()+"/stats?"+query, nil)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			res := rec.Result()
+			defer res.Body.Close()
+
+			if res.StatusCode != http.StatusBadRequest {
+				t.Fatalf("expected 400 Bad Request for %s, got %d", query, res.StatusCode)
+			}
+			var errRes api.ErrorResponse
+			_ = json.NewDecoder(res.Body).Decode(&errRes)
+			if errRes.Error != "invalid query parameter: hours must be between 1 and 720" {
+				t.Errorf("unexpected error message: %q", errRes.Error)
+			}
+			if repo.StatsCalls() != 0 {
+				t.Errorf("expected repo.GetMonitorStats not called for invalid hours")
+			}
+		})
+	}
+
+	t.Run("repository internal error does not leak SQL details", func(t *testing.T) {
+		repo := newFakeMonitorRepo()
+		repo.statsErr = errors.New("pq: syntax error at or near")
+		router := setupMonitorTestRouter(repo)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/monitors/"+uuid.New().String()+"/stats", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		res := rec.Result()
+		defer res.Body.Close()
+
+		if res.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("expected 500, got %d", res.StatusCode)
+		}
+		var errRes api.ErrorResponse
+		_ = json.NewDecoder(res.Body).Decode(&errRes)
+		if strings.Contains(errRes.Error, "pq:") {
+			t.Errorf("leaked internal error: %q", errRes.Error)
+		}
+	})
+}
+
+func TestMonitorHistoryAndStatsRoutes_MethodNotAllowed(t *testing.T) {
+	repo := newFakeMonitorRepo()
+	router := setupMonitorTestRouter(repo)
+	id := uuid.New().String()
+
+	for _, suffix := range []string{"/checks", "/stats"} {
+		for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch} {
+			t.Run(method+"_"+suffix, func(t *testing.T) {
+				req := httptest.NewRequest(method, "/api/v1/monitors/"+id+suffix, nil)
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, req)
+				res := rec.Result()
+				defer res.Body.Close()
+
+				if res.StatusCode != http.StatusMethodNotAllowed {
+					t.Errorf("expected 405 Method Not Allowed for %s %s, got %d", method, suffix, res.StatusCode)
+				}
+			})
+		}
 	}
 }
