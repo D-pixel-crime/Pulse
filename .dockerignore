@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+!.env.example
+AGENTS.md
+docs/
+bin/
+dist/
+pulse
+*.test
+*.out
+*.log
