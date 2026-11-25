@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"net/url"
@@ -85,6 +86,14 @@ func (t *Target) SanitizedURL() string {
 	return u.String()
 }
 
+// LogValue implements slog.LogValuer so structured logs never expose query strings or credentials.
+func (t *Target) LogValue() slog.Value {
+	if t == nil {
+		return slog.StringValue("")
+	}
+	return slog.StringValue(t.SanitizedURL())
+}
+
 // Prohibited IP networks representing non-public, loopback, private, link-local,
 // multicast, and reserved addresses.
 //
@@ -133,6 +142,9 @@ var prohibitedPrefixes = []struct {
 func IsProhibitedIP(addr netip.Addr) (bool, string) {
 	if !addr.IsValid() {
 		return true, "invalid address"
+	}
+	if addr.Zone() != "" {
+		return true, "zoned IPv6 address"
 	}
 
 	// Unmap IPv4-in-IPv6 to evaluate underlying IPv4 against prohibited ranges
@@ -467,6 +479,12 @@ func (d *SafeDialer) DialContext(ctx context.Context, network, addr string) (net
 	// a second unvalidated DNS lookup.
 	var lastErr error
 	for _, addr := range addrs {
+		if dialCtx.Err() != nil {
+			if lastErr == nil {
+				lastErr = dialCtx.Err()
+			}
+			break
+		}
 		targetAddr := net.JoinHostPort(addr.String(), port)
 		conn, err := d.dialer.DialContext(dialCtx, network, targetAddr)
 		if err == nil {

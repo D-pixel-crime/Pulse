@@ -153,6 +153,19 @@ func SanitizeErrorMessage(rawMsg string, target *Target) string {
 // Check performs an HTTP GET request against the validated target with a per-monitor timeout,
 // evaluating the response status code and returning a CheckObservation.
 func (c *Checker) Check(ctx context.Context, target *Target, timeout time.Duration) CheckObservation {
+	if target == nil {
+		now := time.Now().UTC()
+		errMsg := "check target must not be nil"
+		return CheckObservation{
+			CheckedAt:    now,
+			CompletedAt:  now,
+			Success:      false,
+			HTTPStatus:   nil,
+			Latency:      0,
+			ErrorMessage: &errMsg,
+		}
+	}
+
 	checkCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -183,6 +196,9 @@ func (c *Checker) Check(ctx context.Context, target *Target, timeout time.Durati
 	completedAt := checkedAt.Add(latency)
 
 	if err != nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
 		errMsg := SanitizeErrorMessage(err.Error(), target)
 		return CheckObservation{
 			CheckedAt:    checkedAt,
@@ -195,8 +211,10 @@ func (c *Checker) Check(ctx context.Context, target *Target, timeout time.Durati
 	}
 
 	// Drain up to 1KB to allow TCP connection reuse, but discard body bytes immediately
-	defer resp.Body.Close()
-	_, _ = io.CopyN(io.Discard, resp.Body, 1024)
+	if resp.Body != nil {
+		defer resp.Body.Close()
+		_, _ = io.CopyN(io.Discard, resp.Body, 1024)
+	}
 
 	statusCode := resp.StatusCode
 

@@ -61,6 +61,7 @@ func TestChecker_HealthyStatus(t *testing.T) {
 		http.StatusAccepted,
 		http.StatusNoContent,
 		http.StatusResetContent,
+		299,
 	}
 
 	for _, statusCode := range statuses {
@@ -109,10 +110,12 @@ func TestChecker_UnhealthyStatus(t *testing.T) {
 		http.StatusUnauthorized,
 		http.StatusForbidden,
 		http.StatusNotFound,
+		499,
 		http.StatusInternalServerError,
 		http.StatusBadGateway,
 		http.StatusServiceUnavailable,
 		http.StatusGatewayTimeout,
+		599,
 	}
 
 	for _, statusCode := range unhealthyStatuses {
@@ -187,6 +190,57 @@ func TestChecker_RedirectsNotFollowed_RecordedAsHealthy(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("redirect to private IP is not followed", func(t *testing.T) {
+		var requestCount atomic.Int32
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requestCount.Add(1)
+			http.Redirect(w, r, "http://169.254.169.254/latest/meta-data/", http.StatusFound)
+		})
+
+		_, checker, target := setupTestServerAndChecker(t, handler)
+		obs := checker.Check(context.Background(), target, 5*time.Second)
+
+		if !obs.Success || obs.HTTPStatus == nil || *obs.HTTPStatus != http.StatusFound {
+			t.Fatalf("expected 302 healthy non-followed response, got success=%v status=%v err=%v", obs.Success, obs.HTTPStatus, obs.ErrorMessage)
+		}
+		if requestCount.Load() != 1 {
+			t.Fatalf("expected exactly 1 request without following redirect to private IP, got %d", requestCount.Load())
+		}
+	})
+
+	t.Run("status 300 and 399 boundary are healthy and non-200-399 like 199 and 600 are unhealthy", func(t *testing.T) {
+		for _, tc := range []struct {
+			code    int
+			healthy bool
+		}{
+			{199, false},
+			{300, true},
+			{399, true},
+			{600, false},
+		} {
+			tracker := &trackingReadCloser{reader: strings.NewReader("ok")}
+			rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: tc.code,
+					Body:       tracker,
+					Header:     make(http.Header),
+				}, nil
+			})
+			c := NewChecker(nil, withTransport(rt))
+			target, err := ValidateTarget("http://test.example.com/boundary")
+			if err != nil {
+				t.Fatalf("ValidateTarget failed: %v", err)
+			}
+			obs := c.Check(context.Background(), target, 5*time.Second)
+			if obs.Success != tc.healthy {
+				t.Errorf("status %d: expected success=%v, got %v", tc.code, tc.healthy, obs.Success)
+			}
+			if tracker.closeCount != 1 {
+				t.Errorf("status %d: expected body closed once, got %d", tc.code, tracker.closeCount)
+			}
+		}
+	})
 }
 
 func TestChecker_TimeoutExceeded(t *testing.T) {
@@ -318,6 +372,49 @@ func TestChecker_ResponseBodyClosure(t *testing.T) {
 	// Verify response draining behavior remains bounded to 1 KB (1024 bytes)
 	if tracker.readBytes != 1024 {
 		t.Errorf("expected draining bounded to 1024 bytes, got %d bytes read", tracker.readBytes)
+	}
+
+	t.Run("small body and unhealthy 500 response body are also closed once and bounded", func(t *testing.T) {
+		smallTracker := &trackingReadCloser{reader: strings.NewReader("hello")}
+		rtSmall := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: smallTracker, Header: make(http.Header)}, nil
+		})
+		cSmall := NewChecker(nil, withTransport(rtSmall))
+		obsSmall := cSmall.Check(context.Background(), target, 5*time.Second)
+		if !obsSmall.Success || smallTracker.closeCount != 1 || smallTracker.readBytes != 5 {
+			t.Fatalf("unexpected small body handling: success=%v close=%d read=%d", obsSmall.Success, smallTracker.closeCount, smallTracker.readBytes)
+		}
+
+		errTracker := &trackingReadCloser{reader: strings.NewReader(strings.Repeat("E", 4096))}
+		rtErr := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusInternalServerError, Body: errTracker, Header: make(http.Header)}, nil
+		})
+		cErr := NewChecker(nil, withTransport(rtErr))
+		obsErr := cErr.Check(context.Background(), target, 5*time.Second)
+		if obsErr.Success || errTracker.closeCount != 1 || errTracker.readBytes != 1024 {
+			t.Fatalf("unexpected 500 body handling: success=%v close=%d read=%d", obsErr.Success, errTracker.closeCount, errTracker.readBytes)
+		}
+	})
+}
+
+func TestChecker_NilTargetAndProxyDisabled(t *testing.T) {
+	c := NewChecker(nil)
+	obs := c.Check(context.Background(), nil, time.Second)
+	if obs.Success || obs.ErrorMessage == nil || *obs.ErrorMessage == "" {
+		t.Fatalf("expected unhealthy observation for nil target without panic, got %+v", obs)
+	}
+
+	// Verify environment proxy variables are ignored by Checker transport.
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:59999")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:59999")
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	_, proxiedChecker, target := setupTestServerAndChecker(t, handler)
+	obs2 := proxiedChecker.Check(context.Background(), target, 2*time.Second)
+	if !obs2.Success {
+		t.Fatalf("expected direct check to ignore HTTP_PROXY env var, got failure: %v", obs2.ErrorMessage)
 	}
 }
 

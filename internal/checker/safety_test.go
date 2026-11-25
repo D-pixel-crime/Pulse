@@ -1,8 +1,10 @@
 package checker
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net"
 	"net/netip"
 	"strings"
@@ -185,6 +187,16 @@ func TestValidateTarget_ProhibitedIPLiterals(t *testing.T) {
 		{"http://[::ffff:127.0.0.1]", "IPv4-mapped loopback"},
 		{"http://[::ffff:10.0.0.1]", "IPv4-mapped private"},
 		{"http://[::ffff:192.168.1.1]", "IPv4-mapped private"},
+		{"http://[::ffff:169.254.169.254]", "IPv4-mapped link-local metadata"},
+
+		// Additional reserved/non-public IPv4 and zoned IPv6
+		{"http://192.0.2.1", "IPv4 TEST-NET-1"},
+		{"http://198.18.0.1", "IPv4 benchmarking"},
+		{"http://224.0.0.1", "IPv4 multicast"},
+		{"http://[fe80::1%25eth0]", "IPv6 zoned link-local"},
+		{"http://[::1%25lo]", "IPv6 zoned loopback"},
+		{"http://[2001:db8::1%25eth0]", "IPv6 zoned documentation prefix"},
+		{"http://[fc00::1%25eth0]", "IPv6 zoned ULA"},
 	}
 
 	for _, tc := range prohibited {
@@ -540,5 +552,53 @@ func TestValidateTarget_HostnameValidation(t *testing.T) {
 				t.Errorf("expected ErrInvalidHost for %q, got: %v", raw, err)
 			}
 		})
+	}
+}
+
+func TestTarget_LogValue_RedactsQueryAndFragment(t *testing.T) {
+	target, err := ValidateTarget("https://api.example.com/v1/health?apiKey=secret123#section")
+	if err != nil {
+		t.Fatalf("ValidateTarget failed: %v", err)
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	logger.Info("checking target", slog.Any("target", target))
+
+	out := buf.String()
+	if strings.Contains(out, "secret123") || strings.Contains(out, "apiKey") || strings.Contains(out, "#section") {
+		t.Fatalf("Target.LogValue leaked query or fragment in logs: %s", out)
+	}
+	if !strings.Contains(out, "https://api.example.com/v1/health") {
+		t.Fatalf("expected sanitized URL in log output, got: %s", out)
+	}
+}
+
+func TestSafeDialer_DialContext_StopsOnContextCancel(t *testing.T) {
+	ips := []netip.Addr{
+		netip.MustParseAddr("93.184.216.34"),
+		netip.MustParseAddr("93.184.216.35"),
+	}
+	res := &fakeResolver{
+		lookupFunc: func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+			return ips, nil
+		},
+	}
+
+	var dialAttempts int
+	ctx, cancel := context.WithCancel(context.Background())
+	contextDialer := DialContextFunc(func(dCtx context.Context, network, address string) (net.Conn, error) {
+		dialAttempts++
+		cancel()
+		return nil, context.Canceled
+	})
+
+	dialer := NewSafeDialer(WithResolver(res), WithContextDialer(contextDialer))
+	_, err := dialer.DialContext(ctx, "tcp", "multi.example.com:80")
+	if err == nil {
+		t.Fatal("expected error on canceled context")
+	}
+	if dialAttempts != 1 {
+		t.Fatalf("expected dial loop to stop after context cancellation (1 attempt), got %d", dialAttempts)
 	}
 }

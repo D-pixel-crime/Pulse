@@ -177,12 +177,6 @@ func CreateMonitorHandler(repo MonitorRepository, logger *slog.Logger) http.Hand
 			}
 		}
 
-		// Timeout must not exceed interval
-		if timeout > interval {
-			writeError(w, http.StatusBadRequest, "validation failed: timeout_seconds must not exceed interval_seconds")
-			return
-		}
-
 		now := time.Now().UTC()
 		m := &model.Monitor{
 			ID:                  uuid.New(),

@@ -369,8 +369,9 @@ func TestServer_GracefulShutdown_ContextCancellation(t *testing.T) {
 	}
 
 	// Verify that server is stopped and rejects new connections
-	_, err = client.Get(baseURL + "/healthz")
+	afterResp, err := client.Get(baseURL + "/healthz")
 	if err == nil {
+		afterResp.Body.Close()
 		t.Fatal("expected request after shutdown to fail, but it succeeded")
 	}
 }

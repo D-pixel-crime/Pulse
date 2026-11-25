@@ -60,7 +60,7 @@ func (p *WorkerPool[T]) runWorker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case task, ok := <-p.queue:
-			if !ok {
+			if !ok || ctx.Err() != nil {
 				return
 			}
 			p.handler(ctx, task)

@@ -208,15 +208,19 @@ func TestHealthz_IndependentOfReadyz(t *testing.T) {
 	readyReq := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	readyRec := httptest.NewRecorder()
 	router.ServeHTTP(readyRec, readyReq)
-	if readyRec.Result().StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("expected readyz 503, got %d", readyRec.Result().StatusCode)
+	readyRes := readyRec.Result()
+	defer readyRes.Body.Close()
+	if readyRes.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected readyz 503, got %d", readyRes.StatusCode)
 	}
 
 	// Check /healthz -> 200 OK
 	healthReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	healthRec := httptest.NewRecorder()
 	router.ServeHTTP(healthRec, healthReq)
-	if healthRec.Result().StatusCode != http.StatusOK {
-		t.Fatalf("expected healthz 200 OK even when DB down, got %d", healthRec.Result().StatusCode)
+	healthRes := healthRec.Result()
+	defer healthRes.Body.Close()
+	if healthRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected healthz 200 OK even when DB down, got %d", healthRes.StatusCode)
 	}
 }

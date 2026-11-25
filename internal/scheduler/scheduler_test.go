@@ -222,9 +222,22 @@ func TestScheduler_DuplicateInFlightSuppression(t *testing.T) {
 	// Wait for the first check to begin.
 	<-checkStarted
 
-	// Wait until multiple poll cycles have occurred while the first check is blocked.
-	for i := 0; i < 4; i++ {
-		time.Sleep(15 * time.Millisecond)
+	// Wait until multiple poll cycles have actually executed while the first check is blocked.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		st.mu.Lock()
+		polls := st.listCalls
+		st.mu.Unlock()
+		if polls >= 4 {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(releaseCheck)
+			cancel()
+			<-runDone
+			t.Fatalf("timed out waiting for multiple poll cycles; got %d", polls)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	if got := checkCount.Load(); got != 1 {
 		close(releaseCheck)
@@ -752,4 +765,334 @@ func TestScheduler_GracefulShutdownAndBoundedTimeout(t *testing.T) {
 			t.Fatalf("expected InFlightSet empty, got %d", sched.InFlight().Len())
 		}
 	})
+
+	t.Run("drains buffered queued tasks on shutdown within timeout", func(t *testing.T) {
+		now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+		mon1 := newTestMonitor(now.Add(-2*time.Second), "https://example.com/drain1", 60)
+		mon2 := newTestMonitor(now.Add(-1*time.Second), "https://example.com/drain2", 60)
+		st := newFakeDueStore(mon1, mon2)
+		ordered := &orderedDueStore{fakeDueStore: st, order: []uuid.UUID{mon1.ID, mon2.ID}}
+
+		firstStarted := make(chan struct{})
+		releaseFirst := make(chan struct{})
+		var startedOnce sync.Once
+		persistedCh := make(chan uuid.UUID, 5)
+		ordered.onRecordHook = func(p store.RecordCheckParams) {
+			persistedCh <- p.MonitorID
+		}
+
+		chk := fakeChecker{
+			fn: func(ctx context.Context, target *checker.Target, timeout time.Duration) checker.CheckObservation {
+				if strings.HasSuffix(target.RawURL(), "/drain1") {
+					startedOnce.Do(func() { close(firstStarted) })
+					<-releaseFirst
+				}
+				s := http.StatusOK
+				return checker.CheckObservation{
+					CheckedAt:   now,
+					CompletedAt: now.Add(10 * time.Millisecond),
+					Success:     true,
+					HTTPStatus:  &s,
+					Latency:     10 * time.Millisecond,
+				}
+			},
+		}
+
+		sched, err := scheduler.New(
+			ordered,
+			chk,
+			slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+			scheduler.WithWorkerCount(1),
+			scheduler.WithQueueCapacity(5),
+			scheduler.WithPollInterval(10*time.Millisecond),
+			scheduler.WithShutdownTimeout(2*time.Second),
+			scheduler.WithNowFunc(func() time.Time { return now }),
+		)
+		if err != nil {
+			t.Fatalf("scheduler.New failed: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		runDone := make(chan error, 1)
+		go func() {
+			runDone <- sched.Run(ctx)
+		}()
+
+		<-firstStarted
+		// Wait until mon2 is also marked in-flight in the buffered queue before canceling.
+		deadline := time.Now().Add(1 * time.Second)
+		for !sched.InFlight().Contains(mon2.ID) {
+			if time.Now().After(deadline) {
+				close(releaseFirst)
+				cancel()
+				<-runDone
+				t.Fatal("timed out waiting for mon2 to be queued in-flight")
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+
+		cancel()
+		close(releaseFirst)
+
+		select {
+		case err := <-runDone:
+			if err != nil {
+				t.Fatalf("expected clean shutdown, got %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for shutdown drain")
+		}
+
+		if len(persistedCh) != 2 {
+			t.Fatalf("expected both active and queued checks to drain and persist, got %d", len(persistedCh))
+		}
+		if sched.InFlight().Len() != 0 {
+			t.Fatalf("expected InFlightSet empty after drain, got %d", sched.InFlight().Len())
+		}
+	})
+}
+
+func TestScheduler_DuplicateInFlightSuppression_WhileQueued(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	mon1 := newTestMonitor(now.Add(-2*time.Second), "https://example.com/blocker", 60)
+	mon2 := newTestMonitor(now.Add(-1*time.Second), "https://example.com/queued", 60)
+	st := newFakeDueStore(mon1, mon2)
+	ordered := &orderedDueStore{fakeDueStore: st, order: []uuid.UUID{mon1.ID, mon2.ID}}
+
+	mon1Started := make(chan struct{})
+	releaseMon1 := make(chan struct{})
+	var mon2Runs atomic.Int32
+	doneCh := make(chan uuid.UUID, 5)
+	ordered.onRecordHook = func(p store.RecordCheckParams) {
+		doneCh <- p.MonitorID
+	}
+
+	chk := fakeChecker{
+		fn: func(ctx context.Context, target *checker.Target, timeout time.Duration) checker.CheckObservation {
+			if strings.HasSuffix(target.RawURL(), "/blocker") {
+				close(mon1Started)
+				<-releaseMon1
+			} else {
+				mon2Runs.Add(1)
+			}
+			s := http.StatusOK
+			return checker.CheckObservation{
+				CheckedAt:   now,
+				CompletedAt: now.Add(10 * time.Millisecond),
+				Success:     true,
+				HTTPStatus:  &s,
+				Latency:     10 * time.Millisecond,
+			}
+		},
+	}
+
+	sched, err := scheduler.New(
+		ordered,
+		chk,
+		slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+		scheduler.WithWorkerCount(1),
+		scheduler.WithQueueCapacity(10),
+		scheduler.WithPollInterval(1*time.Hour),
+		scheduler.WithNowFunc(func() time.Time { return now }),
+	)
+	if err != nil {
+		t.Fatalf("scheduler.New failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- sched.Run(ctx)
+	}()
+
+	// Poll 1: dispatches mon1 (starts on sole worker) and mon2 (waits in queue).
+	sched.PollOnce(ctx)
+	<-mon1Started
+
+	// Poll 2 while mon2 is still sitting in queue: mon2 must be deduplicated!
+	sched.PollOnce(ctx)
+	sched.PollOnce(ctx)
+
+	close(releaseMon1)
+	for i := 0; i < 2; i++ {
+		<-doneCh
+	}
+
+	cancel()
+	if err := <-runDone; err != nil {
+		t.Fatalf("scheduler.Run failed: %v", err)
+	}
+
+	if got := mon2Runs.Load(); got != 1 {
+		t.Fatalf("expected queued monitor mon2 to run exactly once despite repeated polls, got %d", got)
+	}
+}
+
+func TestScheduler_DueOrderingAndQueueFullDeterministic(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	mon1 := newTestMonitor(now.Add(-3*time.Second), "https://example.com/first", 60)
+	mon2 := newTestMonitor(now.Add(-2*time.Second), "https://example.com/second", 60)
+	mon3 := newTestMonitor(now.Add(-1*time.Second), "https://example.com/third", 60)
+	st := newFakeDueStore(mon1, mon2, mon3)
+	ordered := &orderedDueStore{fakeDueStore: st, order: []uuid.UUID{mon1.ID, mon2.ID, mon3.ID}}
+
+	mon1Started := make(chan struct{})
+	releaseMon1 := make(chan struct{})
+	var mu sync.Mutex
+	var execOrder []uuid.UUID
+	doneCh := make(chan uuid.UUID, 5)
+	ordered.onRecordHook = func(p store.RecordCheckParams) {
+		doneCh <- p.MonitorID
+	}
+
+	chk := fakeChecker{
+		fn: func(ctx context.Context, target *checker.Target, timeout time.Duration) checker.CheckObservation {
+			mu.Lock()
+			switch {
+			case strings.HasSuffix(target.RawURL(), "/first"):
+				execOrder = append(execOrder, mon1.ID)
+			case strings.HasSuffix(target.RawURL(), "/second"):
+				execOrder = append(execOrder, mon2.ID)
+			case strings.HasSuffix(target.RawURL(), "/third"):
+				execOrder = append(execOrder, mon3.ID)
+			}
+			mu.Unlock()
+			if strings.HasSuffix(target.RawURL(), "/first") {
+				close(mon1Started)
+				<-releaseMon1
+			}
+			s := http.StatusOK
+			return checker.CheckObservation{
+				CheckedAt:   now,
+				CompletedAt: now.Add(10 * time.Millisecond),
+				Success:     true,
+				HTTPStatus:  &s,
+				Latency:     10 * time.Millisecond,
+			}
+		},
+	}
+
+	sched, err := scheduler.New(
+		ordered,
+		chk,
+		slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+		scheduler.WithWorkerCount(1),
+		scheduler.WithQueueCapacity(1),
+		scheduler.WithPollInterval(1*time.Hour),
+		scheduler.WithNowFunc(func() time.Time { return now }),
+	)
+	if err != nil {
+		t.Fatalf("scheduler.New failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- sched.Run(ctx)
+	}()
+
+	// Wait until worker is busy? Wait: PollOnce sends mon1, mon2, mon3 synchronously while worker may pick up mon1!
+	// To guarantee mon1 is occupying the worker BEFORE mon2 & mon3 are dispatched, run a two-step deterministic check:
+	// First, enqueue mon1 alone and block worker, then PollOnce with mon2+mon3.
+	ordered.mu.Lock()
+	ordered.order = []uuid.UUID{mon1.ID}
+	ordered.mu.Unlock()
+	sched.PollOnce(ctx)
+	<-mon1Started
+
+	ordered.mu.Lock()
+	ordered.order = []uuid.UUID{mon2.ID, mon3.ID}
+	ordered.mu.Unlock()
+	sched.PollOnce(ctx)
+
+	// mon2 fills queue (cap 1); mon3 hits queue-full and is released from InFlightSet immediately.
+	if !sched.InFlight().Contains(mon1.ID) || !sched.InFlight().Contains(mon2.ID) {
+		close(releaseMon1)
+		cancel()
+		<-runDone
+		t.Fatal("expected mon1 and mon2 to be in-flight")
+	}
+	if sched.InFlight().Contains(mon3.ID) {
+		close(releaseMon1)
+		cancel()
+		<-runDone
+		t.Fatal("expected mon3 to be released from InFlightSet when queue is full")
+	}
+
+	// Unblock mon1 -> mon1 and mon2 finish.
+	close(releaseMon1)
+	<-doneCh
+	<-doneCh
+
+	// Next PollOnce picks up mon3 because its next_check_at remained due.
+	sched.PollOnce(ctx)
+	<-doneCh
+
+	cancel()
+	if err := <-runDone; err != nil {
+		t.Fatalf("scheduler.Run failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(execOrder) != 3 || execOrder[0] != mon1.ID || execOrder[1] != mon2.ID || execOrder[2] != mon3.ID {
+		t.Fatalf("expected deterministic due execution order [%v, %v, %v], got %v", mon1.ID, mon2.ID, mon3.ID, execOrder)
+	}
+}
+
+func TestScheduler_UnsafeMonitorURLPersistsSanitizedFailure(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	mon := newTestMonitor(now, "http://127.0.0.1:8080/internal?token=topsecret999", 60)
+	st := newFakeDueStore(mon)
+
+	persisted := make(chan struct{}, 1)
+	st.onRecordHook = func(store.RecordCheckParams) {
+		persisted <- struct{}{}
+	}
+
+	var checkerCalled atomic.Bool
+	chk := fakeChecker{
+		fn: func(ctx context.Context, target *checker.Target, timeout time.Duration) checker.CheckObservation {
+			checkerCalled.Store(true)
+			return checker.CheckObservation{}
+		},
+	}
+
+	var logBuf syncBuffer
+	sched, err := scheduler.New(
+		st,
+		chk,
+		slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		scheduler.WithWorkerCount(1),
+		scheduler.WithQueueCapacity(5),
+		scheduler.WithPollInterval(1*time.Hour),
+		scheduler.WithNowFunc(func() time.Time { return now }),
+	)
+	if err != nil {
+		t.Fatalf("scheduler.New failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- sched.Run(ctx)
+	}()
+
+	sched.PollOnce(ctx)
+	<-persisted
+	cancel()
+	if err := <-runDone; err != nil {
+		t.Fatalf("scheduler.Run failed: %v", err)
+	}
+
+	if checkerCalled.Load() {
+		t.Fatal("expected unsafe target to be rejected before HealthChecker.Check is invoked")
+	}
+	snap, count, _ := st.snapshot(mon.ID)
+	if count != 1 || snap.ConsecutiveFailures != 1 {
+		t.Fatalf("expected 1 failed check recorded, got count=%d failures=%d", count, snap.ConsecutiveFailures)
+	}
+	if strings.Contains(logBuf.String(), "topsecret999") || strings.Contains(logBuf.String(), "?token=") {
+		t.Fatalf("logs leaked query secret: %s", logBuf.String())
+	}
 }

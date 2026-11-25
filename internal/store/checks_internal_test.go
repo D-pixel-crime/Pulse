@@ -28,11 +28,12 @@ type fakeTxCall struct {
 }
 
 type fakeCheckTx struct {
-	queryRowFunc func(ctx context.Context, sql string, args ...any) pgx.Row
-	commitErr    error
-	calls        []fakeTxCall
-	commitCount  int
-	rollbackCnt  int
+	queryRowFunc   func(ctx context.Context, sql string, args ...any) pgx.Row
+	commitErr      error
+	calls          []fakeTxCall
+	commitCount    int
+	rollbackCnt    int
+	rollbackCtxErr error
 }
 
 func (f *fakeCheckTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
@@ -51,6 +52,11 @@ func (f *fakeCheckTx) Commit(ctx context.Context) error {
 
 func (f *fakeCheckTx) Rollback(ctx context.Context) error {
 	f.rollbackCnt++
+	if ctx == nil {
+		f.rollbackCtxErr = errors.New("nil rollback context")
+	} else {
+		f.rollbackCtxErr = ctx.Err()
+	}
 	return nil
 }
 
@@ -430,6 +436,141 @@ func TestRecordCheckResultTx_ParameterizedSQLAndCommit(t *testing.T) {
 	if out.CheckResult.MonitorID != monitorID || !out.CheckResult.Success || out.CheckResult.LatencyMs != 350 {
 		t.Errorf("unexpected check result persisted: %+v", out.CheckResult)
 	}
+}
+
+func TestRecordCheckResultTx_RollsBackAfterInsertHookAndUsesUncanceledRollbackCtx(t *testing.T) {
+	s := New(nil)
+	monitorID := uuid.New()
+	now := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+
+	t.Run("rolls back before UPDATE when afterInsert hook fails", func(t *testing.T) {
+		tx := &fakeCheckTx{
+			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+				if strings.Contains(sql, "SELECT id, name") {
+					return fakeRow{scanFunc: func(dest ...any) error {
+						return assignMonitorScan(dest, model.Monitor{
+							ID:              monitorID,
+							Name:            "API",
+							URL:             "https://example.com",
+							IntervalSeconds: 60,
+							TimeoutSeconds:  5,
+							CurrentStatus:   model.StatusUnknown,
+							NextCheckAt:     now,
+							CreatedAt:       now,
+							UpdatedAt:       now,
+						})
+					}}
+				}
+				if strings.Contains(sql, "INSERT INTO check_results") {
+					return fakeRow{scanFunc: func(dest ...any) error {
+						*dest[0].(*uuid.UUID) = args[0].(uuid.UUID)
+						*dest[1].(*uuid.UUID) = args[1].(uuid.UUID)
+						*dest[2].(*time.Time) = args[2].(time.Time)
+						*dest[3].(*bool) = args[3].(bool)
+						*dest[4].(**int) = args[4].(*int)
+						*dest[5].(*int64) = args[5].(int64)
+						*dest[6].(**string) = args[6].(*string)
+						return nil
+					}}
+				}
+				t.Fatalf("UPDATE monitors must not run after afterInsert failure, got SQL: %s", sql)
+				return nil
+			},
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		_, err := s.recordCheckResultTx(ctx, tx, RecordCheckParams{
+			MonitorID:   monitorID,
+			CheckedAt:   now,
+			CompletedAt: now.Add(10 * time.Millisecond),
+			Success:     true,
+			LatencyMs:   10,
+		}, func(ctx context.Context, _ checkTx) error {
+			// Cancel caller context and return an error to verify Rollback still receives a live context.
+			cancel()
+			return errors.New("injected mid-tx failure")
+		})
+		if err == nil || !strings.Contains(err.Error(), "injected mid-tx failure") {
+			t.Fatalf("expected injected hook error, got %v", err)
+		}
+		if tx.commitCount != 0 || tx.rollbackCnt != 1 {
+			t.Fatalf("expected 0 commits and 1 rollback, got commits=%d rollbacks=%d", tx.commitCount, tx.rollbackCnt)
+		}
+		if tx.rollbackCtxErr != nil {
+			t.Fatalf("expected Rollback to receive non-canceled context, got err=%v", tx.rollbackCtxErr)
+		}
+	})
+
+	t.Run("truncates error message exceeding 1024 runes before insert", func(t *testing.T) {
+		longErr := strings.Repeat("é", 1200)
+		var capturedErr *string
+		tx := &fakeCheckTx{
+			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+				if strings.Contains(sql, "SELECT id, name") {
+					return fakeRow{scanFunc: func(dest ...any) error {
+						return assignMonitorScan(dest, model.Monitor{
+							ID:              monitorID,
+							Name:            "API",
+							URL:             "https://example.com",
+							IntervalSeconds: 60,
+							TimeoutSeconds:  5,
+							CurrentStatus:   model.StatusUnknown,
+							NextCheckAt:     now,
+							CreatedAt:       now,
+							UpdatedAt:       now,
+						})
+					}}
+				}
+				if strings.Contains(sql, "INSERT INTO check_results") {
+					capturedErr = args[6].(*string)
+					return fakeRow{scanFunc: func(dest ...any) error {
+						*dest[0].(*uuid.UUID) = args[0].(uuid.UUID)
+						*dest[1].(*uuid.UUID) = args[1].(uuid.UUID)
+						*dest[2].(*time.Time) = args[2].(time.Time)
+						*dest[3].(*bool) = args[3].(bool)
+						*dest[4].(**int) = args[4].(*int)
+						*dest[5].(*int64) = args[5].(int64)
+						*dest[6].(**string) = args[6].(*string)
+						return nil
+					}}
+				}
+				return fakeRow{scanFunc: func(dest ...any) error {
+					return assignMonitorScan(dest, model.Monitor{
+						ID:                  monitorID,
+						Name:                "API",
+						URL:                 "https://example.com",
+						IntervalSeconds:     60,
+						TimeoutSeconds:      5,
+						CurrentStatus:       model.Status(args[1].(string)),
+						ConsecutiveFailures: args[2].(int),
+						LastCheckedAt:       args[3].(*time.Time),
+						LastSuccessAt:       args[4].(*time.Time),
+						NextCheckAt:         args[5].(time.Time),
+						CreatedAt:           now,
+						UpdatedAt:           args[6].(time.Time),
+					})
+				}}
+			},
+		}
+
+		out, err := s.recordCheckResultTx(context.Background(), tx, RecordCheckParams{
+			MonitorID:    monitorID,
+			CheckedAt:    now,
+			CompletedAt:  now,
+			Success:      false,
+			LatencyMs:    25,
+			ErrorMessage: &longErr,
+		}, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if capturedErr == nil || len([]rune(*capturedErr)) != model.MaxErrorMessageLength {
+			t.Fatalf("expected persisted error truncated to %d runes, got %d", model.MaxErrorMessageLength, len([]rune(*capturedErr)))
+		}
+		if !strings.HasSuffix(*capturedErr, "...") || out.CheckResult.ErrorMessage == nil {
+			t.Errorf("expected '...' suffix on truncated error message")
+		}
+	})
 }
 
 type fakeRows struct {

@@ -241,6 +241,30 @@ func TestTransitionMonitorHealth_UpWithOneOrTwoFailuresRemainsUp(t *testing.T) {
 	if s3.LastSuccessAt == nil || s3.LastSuccessAt.Equal(mutated) {
 		t.Errorf("failure 3: expected preserved original last_success_at, got %v", s3.LastSuccessAt)
 	}
+
+	// DOWN (3 failures) -> failure 4 -> remains DOWN (failures=4) -> success -> recovers to UP (failures=0)
+	wantNext3 := c3.Add(30 * time.Second)
+	t4 := wantNext3
+	c4 := t4.Add(100 * time.Millisecond)
+	s4, err := model.TransitionMonitorHealth(s3.CurrentStatus, s3.ConsecutiveFailures, s3.LastSuccessAt, interval, false, t4, c4)
+	if err != nil {
+		t.Fatalf("failure 4 returned unexpected error: %v", err)
+	}
+	if s4.CurrentStatus != model.StatusDown || s4.ConsecutiveFailures != 4 {
+		t.Fatalf("failure 4: expected DOWN/4, got %s/%d", s4.CurrentStatus, s4.ConsecutiveFailures)
+	}
+	t5 := wantNext3.Add(30 * time.Second)
+	c5 := t5.Add(50 * time.Millisecond)
+	s5, err := model.TransitionMonitorHealth(s4.CurrentStatus, s4.ConsecutiveFailures, s4.LastSuccessAt, interval, true, t5, c5)
+	if err != nil {
+		t.Fatalf("recovery returned unexpected error: %v", err)
+	}
+	if s5.CurrentStatus != model.StatusUp || s5.ConsecutiveFailures != 0 {
+		t.Fatalf("recovery: expected UP/0, got %s/%d", s5.CurrentStatus, s5.ConsecutiveFailures)
+	}
+	if s5.LastSuccessAt == nil || !s5.LastSuccessAt.Equal(t5) {
+		t.Errorf("recovery: expected last_success_at=%v, got %v", t5, s5.LastSuccessAt)
+	}
 }
 
 func TestTransitionMonitorHealth_ValidationErrors(t *testing.T) {
