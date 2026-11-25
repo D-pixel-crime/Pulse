@@ -32,6 +32,21 @@ func connectTestDB(t *testing.T) *db.DB {
 	}
 	t.Cleanup(database.Close)
 
+	lockConn, err := database.Pool().Acquire(ctx)
+	if err != nil {
+		t.Fatalf("failed to acquire DB lock connection: %v", err)
+	}
+	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_lock(70756973)`); err != nil {
+		lockConn.Release()
+		t.Fatalf("failed to acquire advisory lock: %v", err)
+	}
+	t.Cleanup(func() {
+		unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer unlockCancel()
+		_, _ = lockConn.Exec(unlockCtx, `SELECT pg_advisory_unlock(70756973)`)
+		lockConn.Release()
+	})
+
 	if err := database.RunSchema(ctx); err != nil {
 		t.Fatalf("failed to run schema: %v", err)
 	}
@@ -76,13 +91,53 @@ func TestRecordCheckResult_LiveStateTransitionsAndPersistence(t *testing.T) {
 	err500 := "HTTP status 500 Internal Server Error"
 	status200 := 200
 
+	claimForNextStep := func(makeDue bool) uuid.UUID {
+		t.Helper()
+		if makeDue {
+			if _, execErr := database.Pool().Exec(ctx,
+				`UPDATE monitors SET next_check_at = clock_timestamp() - INTERVAL '1 second' WHERE id = $1`,
+				created.ID,
+			); execErr != nil {
+				t.Fatalf("failed to make monitor due for next check: %v", execErr)
+			}
+		}
+		claimed, claimErr := s.ClaimDueMonitors(ctx, 100)
+		if claimErr != nil {
+			t.Fatalf("ClaimDueMonitors failed: %v", claimErr)
+		}
+		for _, cm := range claimed {
+			if cm.Monitor != nil && cm.Monitor.ID == created.ID {
+				return cm.ClaimToken
+			}
+		}
+		t.Fatalf("expected monitor %v to be claimed", created.ID)
+		return uuid.Nil
+	}
+
+	assertClaimCleared := func(label string) {
+		t.Helper()
+		var tok *uuid.UUID
+		var exp *time.Time
+		if qErr := database.Pool().QueryRow(ctx,
+			`SELECT claim_token, claim_expires_at FROM monitors WHERE id = $1`, created.ID,
+		).Scan(&tok, &exp); qErr != nil {
+			t.Fatalf("%s: failed to inspect claim columns: %v", label, qErr)
+		}
+		if tok != nil || exp != nil {
+			t.Errorf("%s: expected claim_token and claim_expires_at cleared, got tok=%v exp=%v", label, tok, exp)
+		}
+	}
+
 	// 1. UNKNOWN -> failure 1 -> remains UNKNOWN
+	var dbBefore, dbAfter time.Time
+	if err := database.Pool().QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbBefore); err != nil {
+		t.Fatalf("failed to query dbBefore: %v", err)
+	}
 	t1 := time.Now().UTC().Truncate(time.Microsecond)
-	c1 := t1.Add(150 * time.Millisecond)
 	out1, err := s.RecordCheckResult(ctx, RecordCheckParams{
 		MonitorID:    created.ID,
+		ClaimToken:   claimForNextStep(false),
 		CheckedAt:    t1,
-		CompletedAt:  c1,
 		Success:      false,
 		HTTPStatus:   &status500,
 		LatencyMs:    150,
@@ -91,6 +146,10 @@ func TestRecordCheckResult_LiveStateTransitionsAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failure 1 failed: %v", err)
 	}
+	if err := database.Pool().QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbAfter); err != nil {
+		t.Fatalf("failed to query dbAfter: %v", err)
+	}
+	assertClaimCleared("failure 1")
 	if out1.Monitor.CurrentStatus != model.StatusUnknown || out1.Monitor.ConsecutiveFailures != 1 {
 		t.Fatalf("failure 1: expected UNKNOWN/1, got %s/%d", out1.Monitor.CurrentStatus, out1.Monitor.ConsecutiveFailures)
 	}
@@ -101,15 +160,17 @@ func TestRecordCheckResult_LiveStateTransitionsAndPersistence(t *testing.T) {
 	if out1.Monitor.LastSuccessAt != nil {
 		t.Errorf("failure 1: expected nil last_success_at, got %v", out1.Monitor.LastSuccessAt)
 	}
-	assertTimeMicroEqual(t, "failure 1 next_check_at", out1.Monitor.NextCheckAt, c1.Add(60*time.Second))
+	if out1.Monitor.UpdatedAt.Before(dbBefore.Add(-time.Second)) || out1.Monitor.UpdatedAt.After(dbAfter.Add(time.Second)) {
+		t.Errorf("failure 1 updated_at %v outside DB clock window [%v, %v]", out1.Monitor.UpdatedAt, dbBefore, dbAfter)
+	}
+	assertTimeMicroEqual(t, "failure 1 next_check_at = updated_at + interval", out1.Monitor.NextCheckAt, out1.Monitor.UpdatedAt.Add(60*time.Second))
 
 	// 2. UNKNOWN -> failure 2 -> remains UNKNOWN
-	t2 := c1.Add(60 * time.Second)
-	c2 := t2.Add(200 * time.Millisecond)
+	t2 := t1.Add(60 * time.Second)
 	out2, err := s.RecordCheckResult(ctx, RecordCheckParams{
 		MonitorID:    created.ID,
+		ClaimToken:   claimForNextStep(true),
 		CheckedAt:    t2,
-		CompletedAt:  c2,
 		Success:      false,
 		HTTPStatus:   &status500,
 		LatencyMs:    200,
@@ -118,17 +179,17 @@ func TestRecordCheckResult_LiveStateTransitionsAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failure 2 failed: %v", err)
 	}
+	assertClaimCleared("failure 2")
 	if out2.Monitor.CurrentStatus != model.StatusUnknown || out2.Monitor.ConsecutiveFailures != 2 {
 		t.Fatalf("failure 2: expected UNKNOWN/2, got %s/%d", out2.Monitor.CurrentStatus, out2.Monitor.ConsecutiveFailures)
 	}
 
 	// 3. UNKNOWN -> failure 3 -> transitions to DOWN
-	t3 := c2.Add(60 * time.Second)
-	c3 := t3.Add(250 * time.Millisecond)
+	t3 := t2.Add(60 * time.Second)
 	out3, err := s.RecordCheckResult(ctx, RecordCheckParams{
 		MonitorID:    created.ID,
+		ClaimToken:   claimForNextStep(true),
 		CheckedAt:    t3,
-		CompletedAt:  c3,
 		Success:      false,
 		HTTPStatus:   &status500,
 		LatencyMs:    250,
@@ -137,24 +198,25 @@ func TestRecordCheckResult_LiveStateTransitionsAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failure 3 failed: %v", err)
 	}
+	assertClaimCleared("failure 3")
 	if out3.Monitor.CurrentStatus != model.StatusDown || out3.Monitor.ConsecutiveFailures != 3 {
 		t.Fatalf("failure 3: expected DOWN/3, got %s/%d", out3.Monitor.CurrentStatus, out3.Monitor.ConsecutiveFailures)
 	}
 
 	// 4. DOWN -> success -> transitions to UP and resets consecutive_failures
-	t4 := c3.Add(60 * time.Second)
-	c4 := t4.Add(40 * time.Millisecond)
+	t4 := t3.Add(60 * time.Second)
 	out4, err := s.RecordCheckResult(ctx, RecordCheckParams{
-		MonitorID:   created.ID,
-		CheckedAt:   t4,
-		CompletedAt: c4,
-		Success:     true,
-		HTTPStatus:  &status200,
-		LatencyMs:   40,
+		MonitorID:  created.ID,
+		ClaimToken: claimForNextStep(true),
+		CheckedAt:  t4,
+		Success:    true,
+		HTTPStatus: &status200,
+		LatencyMs:  40,
 	})
 	if err != nil {
 		t.Fatalf("success check failed: %v", err)
 	}
+	assertClaimCleared("success check")
 	if out4.Monitor.CurrentStatus != model.StatusUp || out4.Monitor.ConsecutiveFailures != 0 {
 		t.Fatalf("success check: expected UP/0, got %s/%d", out4.Monitor.CurrentStatus, out4.Monitor.ConsecutiveFailures)
 	}
@@ -164,12 +226,11 @@ func TestRecordCheckResult_LiveStateTransitionsAndPersistence(t *testing.T) {
 	assertTimeMicroEqual(t, "success check last_success_at", *out4.Monitor.LastSuccessAt, t4)
 
 	// 5. UP -> failure 1 -> remains UP
-	t5 := c4.Add(60 * time.Second)
-	c5 := t5.Add(300 * time.Millisecond)
+	t5 := t4.Add(60 * time.Second)
 	out5, err := s.RecordCheckResult(ctx, RecordCheckParams{
 		MonitorID:    created.ID,
+		ClaimToken:   claimForNextStep(true),
 		CheckedAt:    t5,
-		CompletedAt:  c5,
 		Success:      false,
 		HTTPStatus:   &status500,
 		LatencyMs:    300,
@@ -178,18 +239,18 @@ func TestRecordCheckResult_LiveStateTransitionsAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UP failure 1 failed: %v", err)
 	}
+	assertClaimCleared("UP failure 1")
 	if out5.Monitor.CurrentStatus != model.StatusUp || out5.Monitor.ConsecutiveFailures != 1 {
 		t.Fatalf("UP failure 1: expected UP/1, got %s/%d", out5.Monitor.CurrentStatus, out5.Monitor.ConsecutiveFailures)
 	}
 	assertTimeMicroEqual(t, "UP failure 1 preserved last_success_at", *out5.Monitor.LastSuccessAt, t4)
 
 	// 6. UP -> failure 2 -> remains UP
-	t6 := c5.Add(60 * time.Second)
-	c6 := t6.Add(310 * time.Millisecond)
+	t6 := t5.Add(60 * time.Second)
 	out6, err := s.RecordCheckResult(ctx, RecordCheckParams{
 		MonitorID:    created.ID,
+		ClaimToken:   claimForNextStep(true),
 		CheckedAt:    t6,
-		CompletedAt:  c6,
 		Success:      false,
 		HTTPStatus:   &status500,
 		LatencyMs:    310,
@@ -198,6 +259,7 @@ func TestRecordCheckResult_LiveStateTransitionsAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UP failure 2 failed: %v", err)
 	}
+	assertClaimCleared("UP failure 2")
 	if out6.Monitor.CurrentStatus != model.StatusUp || out6.Monitor.ConsecutiveFailures != 2 {
 		t.Fatalf("UP failure 2: expected UP/2, got %s/%d", out6.Monitor.CurrentStatus, out6.Monitor.ConsecutiveFailures)
 	}
@@ -239,8 +301,23 @@ func TestRecordCheckResult_LiveTransactionRollback(t *testing.T) {
 		_ = s.Delete(cleanupCtx, created.ID)
 	})
 
-	// Test 1: INSERT check_results succeeds, then a SQL failure aborts the transaction before UPDATE monitors.
+	// Test 1: Claim monitor, then INSERT check_results succeeds and a SQL failure aborts before UPDATE monitors.
 	// Both the INSERT and monitor update must roll back, leaving next_check_at due and check_results empty.
+	claimed, err := s.ClaimDueMonitors(ctx, 100)
+	if err != nil {
+		t.Fatalf("ClaimDueMonitors failed: %v", err)
+	}
+	var claimToken uuid.UUID
+	for _, cm := range claimed {
+		if cm.Monitor != nil && cm.Monitor.ID == created.ID {
+			claimToken = cm.ClaimToken
+			break
+		}
+	}
+	if claimToken == uuid.Nil {
+		t.Fatalf("expected monitor %v to be claimed", created.ID)
+	}
+
 	tx, err := database.Pool().Begin(ctx)
 	if err != nil {
 		t.Fatalf("failed to begin transaction: %v", err)
@@ -248,15 +325,14 @@ func TestRecordCheckResult_LiveTransactionRollback(t *testing.T) {
 
 	status200 := 200
 	checkedAt := time.Now().UTC().Truncate(time.Microsecond)
-	completedAt := checkedAt.Add(100 * time.Millisecond)
 
 	_, err = s.recordCheckResultTx(ctx, tx, RecordCheckParams{
-		MonitorID:   created.ID,
-		CheckedAt:   checkedAt,
-		CompletedAt: completedAt,
-		Success:     true,
-		HTTPStatus:  &status200,
-		LatencyMs:   100,
+		MonitorID:  created.ID,
+		ClaimToken: claimToken,
+		CheckedAt:  checkedAt,
+		Success:    true,
+		HTTPStatus: &status200,
+		LatencyMs:  100,
 	}, func(ctx context.Context, tx checkTx) error {
 		// Force a real PostgreSQL statement error after check_results INSERT inside the same transaction.
 		_, execErr := tx.Exec(ctx, "SELECT 1 / 0")
@@ -298,16 +374,92 @@ func TestRecordCheckResult_LiveTransactionRollback(t *testing.T) {
 	// Test 2: Missing monitor ID returns ErrNotFound and inserts no check_results.
 	missingID := uuid.New()
 	_, err = s.RecordCheckResult(ctx, RecordCheckParams{
-		MonitorID:   missingID,
-		CheckedAt:   checkedAt,
-		CompletedAt: completedAt,
-		Success:     true,
-		HTTPStatus:  &status200,
-		LatencyMs:   100,
+		MonitorID:  missingID,
+		ClaimToken: uuid.New(),
+		CheckedAt:  checkedAt,
+		Success:    true,
+		HTTPStatus: &status200,
+		LatencyMs:  100,
 	})
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("expected ErrNotFound for unknown monitor ID, got %v", err)
 	}
+}
+
+func TestRecordCheckResult_NextCheckAtUsesDBClockNotAppClock_LiveDB(t *testing.T) {
+	database := connectTestDB(t)
+	if database == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	s := New(database.Pool())
+
+	created, err := s.Create(ctx, &model.Monitor{
+		Name:            "DB Clock Schedule Monitor",
+		URL:             "https://api.example.com/db-clock",
+		IntervalSeconds: 45,
+		TimeoutSeconds:  5,
+	})
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	t.Cleanup(func() {
+		cCtx, cCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cCancel()
+		_ = s.Delete(cCtx, created.ID)
+	})
+
+	claimed, err := s.ClaimDueMonitors(ctx, 100)
+	if err != nil {
+		t.Fatalf("ClaimDueMonitors failed: %v", err)
+	}
+	var token uuid.UUID
+	for _, cm := range claimed {
+		if cm.Monitor != nil && cm.Monitor.ID == created.ID {
+			token = cm.ClaimToken
+			break
+		}
+	}
+	if token == uuid.Nil {
+		t.Fatalf("expected monitor %v to be claimed", created.ID)
+	}
+
+	var dbBefore, dbAfter time.Time
+	if err := database.Pool().QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbBefore); err != nil {
+		t.Fatalf("failed to query dbBefore: %v", err)
+	}
+
+	// Pass an intentionally skewed observation CheckedAt (years in the past).
+	// Persistent scheduling timestamps (updated_at, next_check_at) must come from PostgreSQL clock_timestamp().
+	skewedCheckedAt := time.Date(2005, 1, 2, 3, 4, 5, 0, time.UTC)
+	status200 := 200
+	out, err := s.RecordCheckResult(ctx, RecordCheckParams{
+		MonitorID:  created.ID,
+		ClaimToken: token,
+		CheckedAt:  skewedCheckedAt,
+		Success:    true,
+		HTTPStatus: &status200,
+		LatencyMs:  25,
+	})
+	if err != nil {
+		t.Fatalf("RecordCheckResult failed: %v", err)
+	}
+
+	if err := database.Pool().QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbAfter); err != nil {
+		t.Fatalf("failed to query dbAfter: %v", err)
+	}
+
+	if out.Monitor.LastCheckedAt == nil || !out.Monitor.LastCheckedAt.Equal(skewedCheckedAt) {
+		t.Errorf("expected last_checked_at %v, got %v", skewedCheckedAt, out.Monitor.LastCheckedAt)
+	}
+	if out.Monitor.UpdatedAt.Before(dbBefore.Add(-time.Second)) || out.Monitor.UpdatedAt.After(dbAfter.Add(time.Second)) {
+		t.Errorf("expected updated_at %v within PostgreSQL clock window [%v, %v]", out.Monitor.UpdatedAt, dbBefore, dbAfter)
+	}
+	wantNext := out.Monitor.UpdatedAt.Add(45 * time.Second)
+	assertTimeMicroEqual(t, "next_check_at = updated_at + 45s", out.Monitor.NextCheckAt, wantNext)
 }
 
 func TestListChecksAndGetMonitorStats_LiveDB(t *testing.T) {

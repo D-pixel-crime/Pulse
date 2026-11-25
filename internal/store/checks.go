@@ -14,12 +14,13 @@ import (
 	"pulse/internal/model"
 )
 
-// RecordCheckParams holds a completed outbound HTTP check observation to persist.
+// RecordCheckParams holds a completed outbound HTTP check observation to persist
+// along with the fencing claim token that authorized the check.
 // The outbound HTTP request must already have completed before calling RecordCheckResult.
 type RecordCheckParams struct {
 	MonitorID    uuid.UUID
+	ClaimToken   uuid.UUID
 	CheckedAt    time.Time
-	CompletedAt  time.Time
 	Success      bool
 	HTTPStatus   *int
 	LatencyMs    int64
@@ -71,6 +72,9 @@ func validateRecordCheckParams(params RecordCheckParams) error {
 	if params.MonitorID == uuid.Nil {
 		return errors.New("monitor_id must not be nil")
 	}
+	if params.ClaimToken == uuid.Nil {
+		return fmt.Errorf("%w: claim_token must not be nil", ErrClaimLost)
+	}
 	if params.CheckedAt.IsZero() {
 		return model.ErrZeroCheckedAt
 	}
@@ -115,7 +119,8 @@ func (s *Store) recordCheckResultTx(
 		SELECT id, name, url, interval_seconds, timeout_seconds,
 		       current_status, consecutive_failures,
 		       last_checked_at, last_success_at, next_check_at,
-		       created_at, updated_at
+		       created_at, updated_at,
+		       claim_token, claim_expires_at, clock_timestamp()
 		FROM monitors
 		WHERE id = $1
 		FOR UPDATE
@@ -123,11 +128,15 @@ func (s *Store) recordCheckResultTx(
 
 	var current model.Monitor
 	var currentStatus string
+	var currentClaimToken *uuid.UUID
+	var currentClaimExpiresAt *time.Time
+	var dbClock time.Time
 	err := tx.QueryRow(ctx, selectMonitorForUpdateSQL, params.MonitorID).Scan(
 		&current.ID, &current.Name, &current.URL, &current.IntervalSeconds, &current.TimeoutSeconds,
 		&currentStatus, &current.ConsecutiveFailures,
 		&current.LastCheckedAt, &current.LastSuccessAt, &current.NextCheckAt,
 		&current.CreatedAt, &current.UpdatedAt,
+		&currentClaimToken, &currentClaimExpiresAt, &dbClock,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -137,20 +146,24 @@ func (s *Store) recordCheckResultTx(
 	}
 	current.CurrentStatus = model.Status(currentStatus)
 
-	checkedAt := params.CheckedAt.UTC()
-	completedAt := params.CompletedAt.UTC()
-	if params.CompletedAt.IsZero() {
-		completedAt = checkedAt
+	if currentClaimToken == nil {
+		return nil, fmt.Errorf("%w: monitor has no active claim", ErrClaimLost)
 	}
+	if *currentClaimToken != params.ClaimToken {
+		return nil, fmt.Errorf("%w: claim token mismatch", ErrClaimLost)
+	}
+	if currentClaimExpiresAt == nil || !currentClaimExpiresAt.After(dbClock) {
+		return nil, fmt.Errorf("%w: claim expired", ErrClaimLost)
+	}
+
+	checkedAt := params.CheckedAt.UTC()
 
 	nextState, err := model.TransitionMonitorHealth(
 		current.CurrentStatus,
 		current.ConsecutiveFailures,
 		current.LastSuccessAt,
-		current.IntervalSeconds,
 		params.Success,
 		checkedAt,
-		completedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute monitor health transition: %w", err)
@@ -197,18 +210,26 @@ func (s *Store) recordCheckResultTx(
 	}
 
 	const updateMonitorHealthSQL = `
-		UPDATE monitors
+		WITH db_clock AS MATERIALIZED (
+			SELECT clock_timestamp() AS current_time
+		)
+		UPDATE monitors m
 		SET current_status = $2,
 		    consecutive_failures = $3,
 		    last_checked_at = $4,
 		    last_success_at = $5,
-		    next_check_at = $6,
-		    updated_at = $7
-		WHERE id = $1
-		RETURNING id, name, url, interval_seconds, timeout_seconds,
-		          current_status, consecutive_failures,
-		          last_checked_at, last_success_at, next_check_at,
-		          created_at, updated_at
+		    next_check_at = db_clock.current_time + make_interval(secs => m.interval_seconds),
+		    updated_at = db_clock.current_time,
+		    claim_token = NULL,
+		    claim_expires_at = NULL
+		FROM db_clock
+		WHERE m.id = $1
+		  AND m.claim_token = $6
+		  AND m.claim_expires_at > db_clock.current_time
+		RETURNING m.id, m.name, m.url, m.interval_seconds, m.timeout_seconds,
+		          m.current_status, m.consecutive_failures,
+		          m.last_checked_at, m.last_success_at, m.next_check_at,
+		          m.created_at, m.updated_at
 	`
 
 	var updated model.Monitor
@@ -219,8 +240,7 @@ func (s *Store) recordCheckResultTx(
 		nextState.ConsecutiveFailures,
 		nextState.LastCheckedAt,
 		nextState.LastSuccessAt,
-		nextState.NextCheckAt,
-		nextState.UpdatedAt,
+		params.ClaimToken,
 	).Scan(
 		&updated.ID, &updated.Name, &updated.URL, &updated.IntervalSeconds, &updated.TimeoutSeconds,
 		&updatedStatus, &updated.ConsecutiveFailures,
@@ -228,6 +248,9 @@ func (s *Store) recordCheckResultTx(
 		&updated.CreatedAt, &updated.UpdatedAt,
 	)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("%w: claim token mismatched or expired before update", ErrClaimLost)
+		}
 		return nil, fmt.Errorf("failed to update monitor health state: %w", err)
 	}
 	updated.CurrentStatus = model.Status(updatedStatus)

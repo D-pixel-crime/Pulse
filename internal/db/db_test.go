@@ -83,6 +83,15 @@ func TestSchemaSQL_Structure(t *testing.T) {
 	if !strings.Contains(db.SchemaSQL, "idx_monitors_next_check_at") {
 		t.Error("SchemaSQL missing idx_monitors_next_check_at index")
 	}
+	if !strings.Contains(db.SchemaSQL, "idx_monitors_due_claim") {
+		t.Error("SchemaSQL missing idx_monitors_due_claim index")
+	}
+	if !strings.Contains(db.SchemaSQL, "claim_token UUID NULL") {
+		t.Error("SchemaSQL missing claim_token UUID NULL column")
+	}
+	if !strings.Contains(db.SchemaSQL, "claim_expires_at TIMESTAMPTZ NULL") {
+		t.Error("SchemaSQL missing claim_expires_at TIMESTAMPTZ NULL column")
+	}
 	if !strings.Contains(db.SchemaSQL, "idx_check_results_monitor_checked_at") {
 		t.Error("SchemaSQL missing idx_check_results_monitor_checked_at index")
 	}
@@ -130,6 +139,19 @@ func TestDatabase_LiveIntegration(t *testing.T) {
 		return
 	}
 	defer database.Close()
+
+	lockConn, err := database.Pool().Acquire(ctx)
+	if err != nil {
+		t.Fatalf("failed to acquire DB lock connection: %v", err)
+	}
+	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_lock(70756973)`); err != nil {
+		lockConn.Release()
+		t.Fatalf("failed to acquire advisory lock: %v", err)
+	}
+	defer func() {
+		_, _ = lockConn.Exec(context.Background(), `SELECT pg_advisory_unlock(70756973)`)
+		lockConn.Release()
+	}()
 
 	// Verify ping
 	if err := database.Ping(ctx); err != nil {

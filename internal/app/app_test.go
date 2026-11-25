@@ -26,16 +26,35 @@ type fakeAppDueStore struct {
 	recorded atomic.Int32
 }
 
-func (s *fakeAppDueStore) ListDueMonitors(ctx context.Context, now time.Time, limit int) ([]*model.Monitor, error) {
+func (s *fakeAppDueStore) ClaimDueMonitors(ctx context.Context, limit int) ([]model.ClaimedMonitor, error) {
 	if s.recorded.Load() > 0 {
 		return nil, nil
 	}
-	return s.due, nil
+	now := time.Now().UTC()
+	claimed := make([]model.ClaimedMonitor, 0, len(s.due))
+	for _, mon := range s.due {
+		if mon == nil {
+			continue
+		}
+		claimed = append(claimed, model.ClaimedMonitor{
+			Monitor:        mon,
+			ClaimToken:     uuid.New(),
+			ClaimExpiresAt: now.Add(time.Duration(mon.TimeoutSeconds)*time.Second + store.DefaultClaimSafetyMargin),
+		})
+		if len(claimed) >= limit {
+			break
+		}
+	}
+	return claimed, nil
+}
+
+func (s *fakeAppDueStore) ReleaseClaim(ctx context.Context, monitorID, claimToken uuid.UUID) (bool, error) {
+	return true, nil
 }
 
 func (s *fakeAppDueStore) RecordCheckResult(ctx context.Context, params store.RecordCheckParams) (*store.RecordCheckOutput, error) {
 	s.recorded.Add(1)
-	now := params.CompletedAt
+	now := time.Now().UTC()
 	return &store.RecordCheckOutput{
 		CheckResult: &model.CheckResult{
 			ID:        uuid.New(),

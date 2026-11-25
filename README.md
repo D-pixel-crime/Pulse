@@ -1,8 +1,8 @@
 # Pulse
 
-Pulse is a local, demo-grade API uptime monitor implemented as a single Go process backed by PostgreSQL. It periodically runs outbound HTTP/HTTPS health checks against registered endpoints, tracks monitor health state transitions, stores check history in PostgreSQL, and exposes an unauthenticated localhost-only REST API for managing monitors and querying availability and latency statistics.
+Pulse is a local, demo-grade API uptime monitor. Each Pulse instance runs as a single Go process backed by PostgreSQL. Multiple Pulse instances can safely share a single PostgreSQL database: PostgreSQL coordinates monitor claims across instances using row-level locking (`SELECT ... FOR UPDATE SKIP LOCKED`), expiring leases, and claim-token fencing. Each instance maintains its own bounded worker pool and in-memory queue. It periodically runs outbound HTTP/HTTPS health checks against registered endpoints, tracks monitor health state transitions, stores check history in PostgreSQL, and exposes a localhost-only REST API for managing monitors and querying availability and latency statistics.
 
-> **Local / Demo Only**: Pulse is designed strictly for local development and demonstration. It runs as a single process without authentication, alerting, or distributed coordination.
+> **Local / Demo Only**: Pulse is designed strictly for local development and demonstration. The service currently has no authentication or authorization layer and is intended exclusively for localhost binding (`127.0.0.1:8080`). While the PostgreSQL-backed claim and lease architecture supports multiple instances sharing a database, outbound HTTP check execution is at-least-once rather than exactly-once, and horizontal autoscaling has not been deployed or load-tested.
 
 ---
 
@@ -10,28 +10,58 @@ Pulse is a local, demo-grade API uptime monitor implemented as a single Go proce
 
 ```mermaid
 flowchart TD
-    subgraph Process["Pulse (Single Go Process)"]
-        API["REST API Server (net/http)"]
-        Scheduler["In-Process Scheduler (1s ticker)"]
-        InFlight["In-Flight Set (sync.Mutex)"]
-        Queue["Bounded Work Channel (cap: 100)"]
-        Workers["Worker Pool (5 workers)"]
-        Checker["Safe HTTP Checker (Basic SSRF Protection)"]
+    subgraph Instance1["Pulse Instance 1"]
+        API1["REST API Server (127.0.0.1:8080)"]
+        Scheduler1["In-Process Scheduler (1s ticker)"]
+        InFlight1["In-Flight Set (local dedup)"]
+        Queue1["Bounded Work Channel (cap: 100)"]
+        Workers1["Worker Pool (5 workers)"]
+        Checker1["Safe HTTP Checker (Basic SSRF Protection)"]
+    end
+
+    subgraph Instance2["Pulse Instance 2"]
+        API2["REST API Server (127.0.0.1:8081)"]
+        Scheduler2["In-Process Scheduler (1s ticker)"]
+        InFlight2["In-Flight Set (local dedup)"]
+        Queue2["Bounded Work Channel (cap: 100)"]
+        Workers2["Worker Pool (5 workers)"]
+        Checker2["Safe HTTP Checker (Basic SSRF Protection)"]
     end
 
     DB[("PostgreSQL\n(monitors, check_results)")]
     Targets["Target HTTP/HTTPS Endpoints"]
 
-    API -->|"CRUD, History, Stats, /readyz"| DB
-    Scheduler -->|"Poll due monitors\n(next_check_at <= current UTC time)"| DB
-    Scheduler -->|"Deduplicate"| InFlight
-    Scheduler -->|"Non-blocking send"| Queue
-    Queue -->|"Dequeue"| Workers
-    Workers -->|"HTTP GET"| Checker
-    Checker -->|"Outbound request"| Targets
-    Workers -->|"Tx: insert check_results + update monitor"| DB
-    Workers -->|"Release marker"| InFlight
+    API1 -->|"CRUD, History, Stats, /readyz"| DB
+    API2 -->|"CRUD, History, Stats, /readyz"| DB
+
+    Scheduler1 -->|"Claim due monitors\n(FOR UPDATE SKIP LOCKED)"| DB
+    Scheduler2 -->|"Claim due monitors\n(FOR UPDATE SKIP LOCKED)"| DB
+
+    Scheduler1 -->|"Deduplicate"| InFlight1
+    Scheduler1 -->|"Non-blocking send"| Queue1
+    Queue1 -->|"Dequeue"| Workers1
+    Workers1 -->|"HTTP GET"| Checker1
+    Checker1 -->|"Outbound request"| Targets
+    Workers1 -->|"Tx: insert check_results + fenced update"| DB
+    Workers1 -->|"Release marker"| InFlight1
+
+    Scheduler2 -->|"Deduplicate"| InFlight2
+    Scheduler2 -->|"Non-blocking send"| Queue2
+    Queue2 -->|"Dequeue"| Workers2
+    Workers2 -->|"HTTP GET"| Checker2
+    Checker2 -->|"Outbound request"| Targets
+    Workers2 -->|"Tx: insert check_results + fenced update"| DB
+    Workers2 -->|"Release marker"| InFlight2
 ```
+
+### Multi-Instance Coordination & In-Process Architecture
+
+- **Single-Process Instances**: Each Pulse instance runs as a standalone Go binary process with its own background scheduler, fixed worker pool (default `5` workers), and bounded in-memory work channel (default capacity `100`).
+- **PostgreSQL Coordination**: Multiple Pulse instances can safely share PostgreSQL as their coordination tier. Due monitors are claimed using `SELECT ... FOR UPDATE OF m SKIP LOCKED` with temporary leases (`claim_expires_at = db_clock.current_time + timeout_seconds + 30s`) and unique `claim_token` UUIDs generated by PostgreSQL's clock.
+- **Claim-Token Fencing**: Workers perform outbound HTTP requests outside database transactions, then commit results within a transaction that verifies `m.claim_token = $6 AND m.claim_expires_at > db_clock.current_time`. Stale workers whose leases expired cannot overwrite newer claims.
+- **At-Least-Once Execution**: The design coordinates multiple instances safely, but outbound HTTP checks are at-least-once rather than exactly-once. If an instance crashes or stalls after executing an HTTP check but before committing the database transaction, the claim expires and another instance will retry the check.
+- **Autoscaling Status**: The architecture supports multiple instances sharing a database, but dynamic horizontal autoscaling has not been deployed or load-tested in production.
+- **Current Authentication State**: The REST API currently operates without authentication or authorization, binding strictly to localhost (`127.0.0.1:8080`). Until dedicated authentication work is implemented, the API must not be exposed to untrusted networks.
 
 ### Database Schema
 
@@ -195,11 +225,23 @@ curl -i -X DELETE "http://127.0.0.1:8080/api/v1/monitors/${MONITOR_ID}"
 
 ## Scheduling Behavior
 
-- **1-Second Poller**: Every `SCHEDULER_POLL_INTERVAL` (`1s`), the scheduler queries up to 100 due monitors using a parameterized query against the supplied current UTC time (`next_check_at <= $1`, ordered by `next_check_at ASC, id ASC`).
-- **In-Flight Deduplication**: Before enqueueing, each monitor ID is checked against an in-memory `InFlightSet` (`sync.Mutex`-guarded `map[uuid.UUID]struct{}`). Monitors already queued or executing are skipped.
-- **Bounded Queue & Saturation**: Tasks are sent with a non-blocking `select` into a buffered channel of capacity `QUEUE_CAPACITY` (`100`). If the channel is full, the monitor's in-flight marker is immediately removed and `next_check_at` is left unchanged in PostgreSQL so it remains due on the next tick.
-- **Post-Commit Schedule Advancement**: A worker executes the check, opens a PostgreSQL transaction, inserts the row into `check_results`, updates the monitor state, and advances `next_check_at` to `completed_at + interval_seconds`. If persistence fails or rolls back, `next_check_at` is unchanged so the monitor remains due for retry.
-- **Restart Behavior**: Checks do not run while Pulse is stopped. On restart, any overdue monitor (`next_check_at <= current UTC time`) is checked once; missed intervals are never backfilled or replayed.
+- **1-Second Poller & Free-Slot Claiming**: Every `SCHEDULER_POLL_INTERVAL` (`1s`), the scheduler computes local free execution slots (`WORKER_COUNT - InFlightSet.Len()`) and atomically claims up to `min(freeSlots, 100, QUEUE_CAPACITY)` due, unclaimed (or lease-expired) monitors in PostgreSQL using `statement_timestamp()` and `SELECT ... FOR UPDATE OF m SKIP LOCKED` ordered by `next_check_at ASC, id ASC`. Claiming sets `claim_token` and `claim_expires_at = current_time + timeout_seconds + 30s` without advancing `next_check_at`.
+- **In-Flight Deduplication**: Before enqueueing, each monitor ID is checked against an in-memory `InFlightSet` (`sync.Mutex`-guarded `map[uuid.UUID]struct{}`). Monitors already queued or executing in the same process are skipped (with any redundant DB claim released immediately), while PostgreSQL claims coordinate across multiple instances.
+- **Bounded Queue & Saturation**: Tasks are sent with a non-blocking `select` into a buffered channel of capacity `QUEUE_CAPACITY` (`100`). If the channel is full, the monitor's in-flight marker is removed and its exact `claim_token` is released in PostgreSQL without advancing `next_check_at` so it remains due on the next tick.
+- **Fenced Post-Commit Schedule Advancement**: A worker executes the outbound HTTP check outside any database transaction, then opens a PostgreSQL transaction, locks the monitor row (`FOR UPDATE`), inserts the `check_results` row, and conditionally updates the monitor using a materialized `clock_timestamp()` CTE (`next_check_at = current_time + interval_seconds`, `updated_at = current_time`, clearing claim fields) only if `claim_token` matches and `claim_expires_at > current_time`. If the claim is lost/expired or persistence fails, the transaction rolls back (transient errors release the claim without advancing `next_check_at`; shutdown cancellations release the claim without recording an endpoint failure).
+- **Timestamp Ownership**: Separating PostgreSQL-owned scheduling/lease timestamps from HTTP observation timestamps prevents application clock skew across instances from affecting monitor scheduling or distributed lease decisions:
+
+| Timestamp | Source |
+|---|---|
+| `created_at` | PostgreSQL |
+| `updated_at` | PostgreSQL |
+| `next_check_at` | PostgreSQL |
+| `claim_expires_at` | PostgreSQL |
+| `checked_at` | HTTP check observation |
+| `last_checked_at` | HTTP check observation |
+| `last_success_at` | HTTP check observation |
+
+- **Restart & Execution Behavior**: Checks do not run while Pulse is stopped. On restart, any overdue monitor (`next_check_at <= statement_timestamp()`) is claimed and checked once; missed intervals are never backfilled or replayed. Pulse provides lease-based retry and fenced persistence, not exactly-once HTTP execution.
 
 ---
 
@@ -248,10 +290,11 @@ DATABASE_URL=postgres://pulse:pulse@localhost:5432/pulse?sslmode=disable go test
 
 ## Limitations & Scope Boundaries
 
-- **Single process / single instance only**: There is no clustering, leader election, or multi-instance coordination.
+- **Multi-instance coordination via PostgreSQL**: Multiple Pulse instances can safely share PostgreSQL via row-level locks, expiring leases, and fencing tokens. However, there is no cluster management or leader election framework, and horizontal autoscaling has not been deployed or load-tested in production.
+- **At-least-once check execution**: Outbound HTTP checks are at-least-once rather than exactly-once. If an instance crashes or network delays cause lease expiration after an HTTP check has been executed but before the result is committed, another instance may claim the monitor and repeat the check. Fencing ensures stale workers cannot overwrite newer claims or check state.
+- **Current API authentication state**: The REST API currently has no authentication or authorization layer. It binds to localhost (`127.0.0.1:8080`) and is intended strictly for local development and demonstration. Until dedicated authentication work is implemented, the API must not be exposed to untrusted networks.
 - **In-memory queue**: The bounded work channel lives in memory only; queued tasks are not persisted as job rows and do not survive process restarts.
-- **Checks pause while Pulse is stopped**: No checks execute while the process is down, and missed intervals are never replayed or backfilled on startup.
-- **No authentication or authorization**: The REST API has no auth layer and is intended strictly for localhost binding (`127.0.0.1:8080`).
+- **Checks pause while an instance is stopped**: No checks execute while an instance is down, and missed intervals are never replayed or backfilled on startup.
 - **Local / demo only**: Not hardened for multi-tenant or public-internet deployment. Default credentials (`pulse`/`pulse`) are for local development only.
 - **Basic SSRF protections are not a production security guarantee**: Dial-path DNS/IP validation, redirect blocking, and proxy disabling reduce accidental access to non-public networks in a local demo, but are not a substitute for network-level egress firewalls or production isolation.
 - **Simple availability estimate is not an SLA**: Availability (`(successful_checks / total_checks) * 100`) is a straightforward ratio over observed checks in the selected window, not a formal SLA/SLO calculation.

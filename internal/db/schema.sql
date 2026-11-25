@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS monitors (
     last_checked_at TIMESTAMPTZ NULL,
     last_success_at TIMESTAMPTZ NULL,
     next_check_at TIMESTAMPTZ NOT NULL,
+    claim_token UUID NULL,
+    claim_expires_at TIMESTAMPTZ NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -29,6 +31,10 @@ CREATE TABLE IF NOT EXISTS check_results (
 -- Index for due-monitor poller lookup
 CREATE INDEX IF NOT EXISTS idx_monitors_next_check_at 
 ON monitors (next_check_at);
+
+-- Index for claimable due-monitor lookup and deterministic ordering
+CREATE INDEX IF NOT EXISTS idx_monitors_due_claim
+ON monitors (next_check_at, claim_expires_at, id);
 
 -- Index for recent history lookup and stats aggregation by monitor
 CREATE INDEX IF NOT EXISTS idx_check_results_monitor_checked_at 

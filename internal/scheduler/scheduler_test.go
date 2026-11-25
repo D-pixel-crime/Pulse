@@ -37,15 +37,33 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
+type fakeClaimState struct {
+	token     uuid.UUID
+	expiresAt time.Time
+}
+
+type releaseCall struct {
+	monitorID  uuid.UUID
+	claimToken uuid.UUID
+}
+
 type fakeDueStore struct {
-	mu           sync.Mutex
-	monitors     map[uuid.UUID]*model.Monitor
-	checks       map[uuid.UUID][]*model.CheckResult
-	listErr      error
-	recordErr    error
-	recordCalls  int
-	listCalls    int
-	onRecordHook func(params store.RecordCheckParams)
+	mu              sync.Mutex
+	monitors        map[uuid.UUID]*model.Monitor
+	claims          map[uuid.UUID]fakeClaimState
+	checks          map[uuid.UUID][]*model.CheckResult
+	clock           func() time.Time
+	listErr         error
+	recordErr       error
+	releaseErr      error
+	recordCalls     int
+	listCalls       int
+	listLimits      []int
+	releaseCalls    []releaseCall
+	ignoreClaimLock bool
+	onRecordHook    func(params store.RecordCheckParams)
+	onClaimHook     func(limit int, claimed []model.ClaimedMonitor)
+	onReleaseHook   func(monitorID, claimToken uuid.UUID, released bool)
 }
 
 func newFakeDueStore(monitors ...*model.Monitor) *fakeDueStore {
@@ -56,30 +74,72 @@ func newFakeDueStore(monitors ...*model.Monitor) *fakeDueStore {
 	}
 	return &fakeDueStore{
 		monitors: m,
+		claims:   make(map[uuid.UUID]fakeClaimState),
 		checks:   make(map[uuid.UUID][]*model.CheckResult),
+		clock:    func() time.Time { return time.Now().UTC() },
 	}
 }
 
-func (f *fakeDueStore) ListDueMonitors(ctx context.Context, now time.Time, limit int) ([]*model.Monitor, error) {
+func (f *fakeDueStore) ClaimDueMonitors(ctx context.Context, limit int) ([]model.ClaimedMonitor, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	now := f.clock().UTC()
 	f.listCalls++
+	f.listLimits = append(f.listLimits, limit)
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
 
-	var due []*model.Monitor
+	var claimed []model.ClaimedMonitor
 	for _, mon := range f.monitors {
-		if !mon.NextCheckAt.After(now) {
-			cp := *mon
-			due = append(due, &cp)
-			if len(due) >= limit {
-				break
+		if mon.NextCheckAt.After(now) {
+			continue
+		}
+		if !f.ignoreClaimLock {
+			if cl, active := f.claims[mon.ID]; active && cl.expiresAt.After(now) {
+				continue
 			}
 		}
+		tok := uuid.New()
+		exp := now.Add(time.Duration(mon.TimeoutSeconds)*time.Second + store.DefaultClaimSafetyMargin)
+		f.claims[mon.ID] = fakeClaimState{token: tok, expiresAt: exp}
+		cp := *mon
+		claimed = append(claimed, model.ClaimedMonitor{
+			Monitor:        &cp,
+			ClaimToken:     tok,
+			ClaimExpiresAt: exp,
+		})
+		if len(claimed) >= limit {
+			break
+		}
 	}
-	return due, nil
+	if f.onClaimHook != nil {
+		f.onClaimHook(limit, claimed)
+	}
+	return claimed, nil
+}
+
+func (f *fakeDueStore) ReleaseClaim(ctx context.Context, monitorID, claimToken uuid.UUID) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.releaseCalls = append(f.releaseCalls, releaseCall{monitorID: monitorID, claimToken: claimToken})
+	if f.releaseErr != nil {
+		return false, f.releaseErr
+	}
+	cl, ok := f.claims[monitorID]
+	if !ok || cl.token != claimToken {
+		if f.onReleaseHook != nil {
+			f.onReleaseHook(monitorID, claimToken, false)
+		}
+		return false, nil
+	}
+	delete(f.claims, monitorID)
+	if f.onReleaseHook != nil {
+		f.onReleaseHook(monitorID, claimToken, true)
+	}
+	return true, nil
 }
 
 func (f *fakeDueStore) RecordCheckResult(ctx context.Context, params store.RecordCheckParams) (*store.RecordCheckOutput, error) {
@@ -98,26 +158,30 @@ func (f *fakeDueStore) RecordCheckResult(ctx context.Context, params store.Recor
 	if !ok {
 		return nil, store.ErrNotFound
 	}
+	cl, ok := f.claims[params.MonitorID]
+	if !ok || cl.token != params.ClaimToken {
+		return nil, store.ErrClaimLost
+	}
 
 	nextState, err := model.TransitionMonitorHealth(
 		mon.CurrentStatus,
 		mon.ConsecutiveFailures,
 		mon.LastSuccessAt,
-		mon.IntervalSeconds,
 		params.Success,
 		params.CheckedAt,
-		params.CompletedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
 
+	dbNow := f.clock().UTC()
 	mon.CurrentStatus = nextState.CurrentStatus
 	mon.ConsecutiveFailures = nextState.ConsecutiveFailures
 	mon.LastCheckedAt = nextState.LastCheckedAt
 	mon.LastSuccessAt = nextState.LastSuccessAt
-	mon.NextCheckAt = nextState.NextCheckAt
-	mon.UpdatedAt = nextState.UpdatedAt
+	mon.NextCheckAt = dbNow.Add(time.Duration(mon.IntervalSeconds) * time.Second)
+	mon.UpdatedAt = dbNow
+	delete(f.claims, params.MonitorID)
 
 	cr := &model.CheckResult{
 		ID:           uuid.New(),
@@ -136,6 +200,13 @@ func (f *fakeDueStore) RecordCheckResult(ctx context.Context, params store.Recor
 		CheckResult: &crCopy,
 		Monitor:     &monCopy,
 	}, nil
+}
+
+func (f *fakeDueStore) hasClaim(id uuid.UUID) (fakeClaimState, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cl, ok := f.claims[id]
+	return cl, ok
 }
 
 func (f *fakeDueStore) snapshot(id uuid.UUID) (model.Monitor, int, int) {
@@ -171,6 +242,10 @@ func TestScheduler_DuplicateInFlightSuppression(t *testing.T) {
 	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
 	mon := newTestMonitor(now, "https://example.com/health", 60)
 	st := newFakeDueStore(mon)
+	st.clock = func() time.Time { return now }
+	// Simulate the monitor re-appearing in ClaimDueMonitors while still locally executing
+	// so we verify InFlightSet suppresses duplicate enqueueing and releases redundant claims.
+	st.ignoreClaimLock = true
 
 	checkStarted := make(chan struct{}, 5)
 	releaseCheck := make(chan struct{})
@@ -252,6 +327,11 @@ func TestScheduler_DuplicateInFlightSuppression(t *testing.T) {
 		t.Fatal("expected monitor ID to remain in InFlightSet while check is executing")
 	}
 
+	// Disable re-claiming before releasing so persistence succeeds cleanly with the original token.
+	st.mu.Lock()
+	st.ignoreClaimLock = false
+	st.mu.Unlock()
+
 	// Release the blocked check and wait for persistence.
 	close(releaseCheck)
 	<-persisted
@@ -271,31 +351,24 @@ func TestScheduler_DuplicateInFlightSuppression(t *testing.T) {
 
 func TestScheduler_QueueFullReleasesInFlightAndRetriesLater(t *testing.T) {
 	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
-	mon1 := newTestMonitor(now.Add(-3*time.Second), "https://example.com/1", 60)
-	mon2 := newTestMonitor(now.Add(-2*time.Second), "https://example.com/2", 60)
-	mon3 := newTestMonitor(now.Add(-1*time.Second), "https://example.com/3", 60)
-	st := newFakeDueStore(mon1, mon2, mon3)
+	mon1 := newTestMonitor(now.Add(-2*time.Second), "https://example.com/1", 60)
+	mon2 := newTestMonitor(now.Add(-1*time.Second), "https://example.com/2", 60)
+	st := newFakeDueStore(mon1, mon2)
+	st.clock = func() time.Time { return now }
 
-	// Deterministic FIFO order via custom ListDueMonitors wrapper.
+	// Deterministic FIFO order via custom ClaimDueMonitors wrapper.
 	orderedStore := &orderedDueStore{
 		fakeDueStore: st,
-		order:        []uuid.UUID{mon1.ID, mon2.ID, mon3.ID},
+		order:        []uuid.UUID{mon1.ID, mon2.ID},
 	}
 
-	firstStarted := make(chan uuid.UUID, 5)
-	releaseFirst := make(chan struct{})
 	allDone := make(chan uuid.UUID, 10)
-
 	orderedStore.onRecordHook = func(p store.RecordCheckParams) {
 		allDone <- p.MonitorID
 	}
 
 	chk := fakeChecker{
 		fn: func(ctx context.Context, target *checker.Target, timeout time.Duration) checker.CheckObservation {
-			if strings.HasSuffix(target.RawURL(), "/1") {
-				firstStarted <- mon1.ID
-				<-releaseFirst
-			}
 			status := http.StatusOK
 			return checker.CheckObservation{
 				CheckedAt:   now,
@@ -312,7 +385,7 @@ func TestScheduler_QueueFullReleasesInFlightAndRetriesLater(t *testing.T) {
 		orderedStore,
 		chk,
 		slog.New(slog.NewJSONHandler(&logBuf, nil)),
-		scheduler.WithWorkerCount(1),
+		scheduler.WithWorkerCount(2),
 		scheduler.WithQueueCapacity(1),
 		scheduler.WithPollInterval(15*time.Millisecond),
 		scheduler.WithNowFunc(func() time.Time { return now }),
@@ -321,63 +394,50 @@ func TestScheduler_QueueFullReleasesInFlightAndRetriesLater(t *testing.T) {
 		t.Fatalf("scheduler.New failed: %v", err)
 	}
 
-	// Start scheduler with a long-ish poll interval first? No: 15ms poll interval, or test PollOnce?
-	// Let's use a 1h ticker in Run? No, let's let Run tick with 20ms and verify mon3 was dropped on tick 1
-	// and picked up on tick N after release!
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// Poll 1 (before Run starts workers): claims mon1 (limit=min(2,100,1)=1) and fills queue cap 1.
+	sched.PollOnce(ctx)
+	// Poll 2 (before Run drains queue): freeSlots=2-1=1, claims mon2, TryEnqueue fails -> releases mon2 claim & InFlightSet.
+	sched.PollOnce(ctx)
+
+	if !strings.Contains(logBuf.String(), "work queue full") {
+		cancel()
+		t.Fatalf("expected queue-full warning log, got: %s", logBuf.String())
+	}
+	if sched.InFlight().Contains(mon2.ID) {
+		cancel()
+		t.Fatal("expected mon2 in-flight marker to be released immediately when queue was full")
+	}
+	if _, active := st.hasClaim(mon2.ID); active {
+		cancel()
+		t.Fatal("expected mon2 DB claim to be released immediately when queue was full")
+	}
+	mon2Snap, mon2Checks, _ := st.snapshot(mon2.ID)
+	if mon2Checks != 0 {
+		cancel()
+		t.Fatalf("expected 0 checks persisted for mon2 before retry, got %d", mon2Checks)
+	}
+	if !mon2Snap.NextCheckAt.Equal(now.Add(-1 * time.Second)) {
+		cancel()
+		t.Fatalf("expected mon2 next_check_at unchanged, got %v", mon2Snap.NextCheckAt)
+	}
+
+	// Now start Run; mon1 drains and mon2 is retried and completed on subsequent tick.
 	runDone := make(chan error, 1)
 	go func() {
 		runDone <- sched.Run(ctx)
 	}()
 
-	// Wait until worker is busy with mon1 (and queue cap 1 holds mon2, so mon3 hit queue full).
-	<-firstStarted
-
-	// Poll a couple ticks while mon1 is still blocked to make sure queue-full path triggers and releases mon3.
-	deadline := time.Now().Add(2 * time.Second)
-	for !strings.Contains(logBuf.String(), "work queue full") {
-		if time.Now().After(deadline) {
-			close(releaseFirst)
-			cancel()
-			<-runDone
-			t.Fatalf("expected queue-full warning log, got: %s", logBuf.String())
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	// mon3 was rejected from full queue, so it must NOT remain stuck in InFlightSet and its NextCheckAt must stay due.
-	if sched.InFlight().Contains(mon3.ID) {
-		close(releaseFirst)
-		cancel()
-		<-runDone
-		t.Fatal("expected mon3 in-flight marker to be released immediately when queue was full")
-	}
-	mon3Snap, mon3Checks, _ := st.snapshot(mon3.ID)
-	if mon3Checks != 0 {
-		close(releaseFirst)
-		cancel()
-		<-runDone
-		t.Fatalf("expected 0 checks persisted for mon3 while blocked, got %d", mon3Checks)
-	}
-	if !mon3Snap.NextCheckAt.Equal(now.Add(-1 * time.Second)) {
-		close(releaseFirst)
-		cancel()
-		<-runDone
-		t.Fatalf("expected mon3 next_check_at unchanged, got %v", mon3Snap.NextCheckAt)
-	}
-
-	// Now unblock mon1; mon2 and mon3 should both complete via retry on subsequent tick.
-	close(releaseFirst)
-
 	seen := map[uuid.UUID]bool{}
-	for len(seen) < 3 {
+	for len(seen) < 2 {
 		select {
 		case id := <-allDone:
 			seen[id] = true
 		case <-time.After(3 * time.Second):
 			cancel()
 			<-runDone
-			t.Fatalf("timed out waiting for all 3 monitors to complete; seen=%v", seen)
+			t.Fatalf("timed out waiting for both monitors to complete; seen=%v", seen)
 		}
 	}
 
@@ -396,22 +456,37 @@ type orderedDueStore struct {
 	order []uuid.UUID
 }
 
-func (o *orderedDueStore) ListDueMonitors(ctx context.Context, now time.Time, limit int) ([]*model.Monitor, error) {
+func (o *orderedDueStore) ClaimDueMonitors(ctx context.Context, limit int) ([]model.ClaimedMonitor, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	now := o.clock().UTC()
 	o.listCalls++
-	var due []*model.Monitor
+	o.listLimits = append(o.listLimits, limit)
+	var claimed []model.ClaimedMonitor
 	for _, id := range o.order {
 		mon := o.monitors[id]
-		if mon != nil && !mon.NextCheckAt.After(now) {
-			cp := *mon
-			due = append(due, &cp)
-			if len(due) >= limit {
-				break
+		if mon == nil || mon.NextCheckAt.After(now) {
+			continue
+		}
+		if !o.ignoreClaimLock {
+			if cl, active := o.claims[mon.ID]; active && cl.expiresAt.After(now) {
+				continue
 			}
 		}
+		tok := uuid.New()
+		exp := now.Add(time.Duration(mon.TimeoutSeconds)*time.Second + store.DefaultClaimSafetyMargin)
+		o.claims[mon.ID] = fakeClaimState{token: tok, expiresAt: exp}
+		cp := *mon
+		claimed = append(claimed, model.ClaimedMonitor{
+			Monitor:        &cp,
+			ClaimToken:     tok,
+			ClaimExpiresAt: exp,
+		})
+		if len(claimed) >= limit {
+			break
+		}
 	}
-	return due, nil
+	return claimed, nil
 }
 
 func TestScheduler_WorkerResultFlow_SuccessDownAndDueRescheduling(t *testing.T) {
@@ -422,6 +497,7 @@ func TestScheduler_WorkerResultFlow_SuccessDownAndDueRescheduling(t *testing.T) 
 	// Monitor overdue by 2 hours: must be checked ONCE on restart, not replayed!
 	mon := newTestMonitor(now.Add(-2*time.Hour), "https://example.com/api", 60)
 	st := newFakeDueStore(mon)
+	st.clock = func() time.Time { return currentNow.Load().(time.Time) }
 
 	var nextHealthy atomic.Bool
 	nextHealthy.Store(false)
@@ -476,7 +552,7 @@ func TestScheduler_WorkerResultFlow_SuccessDownAndDueRescheduling(t *testing.T) 
 		runDone <- sched.Run(ctx)
 	}()
 
-	// 1st check (overdue by 2h): runs ONCE, fails -> status remains UNKNOWN, failures=1, next_check_at = now + 30ms + 60s
+	// 1st check (overdue by 2h): runs ONCE, fails -> status remains UNKNOWN, failures=1, next_check_at = now + 60s
 	<-doneCh
 	time.Sleep(40 * time.Millisecond) // verify no replay occurs while currentNow hasn't reached next_check_at
 	snap, count, _ := st.snapshot(mon.ID)
@@ -490,7 +566,7 @@ func TestScheduler_WorkerResultFlow_SuccessDownAndDueRescheduling(t *testing.T) 
 		<-runDone
 		t.Fatalf("expected UNKNOWN with 1 failure, got status=%s failures=%d", snap.CurrentStatus, snap.ConsecutiveFailures)
 	}
-	wantNext := now.Add(30*time.Millisecond + 60*time.Second)
+	wantNext := now.Add(60 * time.Second)
 	if !snap.NextCheckAt.Equal(wantNext) {
 		cancel()
 		<-runDone
@@ -538,6 +614,7 @@ func TestScheduler_PersistenceFailureLeavesDueAndLogsSanitized(t *testing.T) {
 	// Include query secret in URL to ensure it is NEVER logged on persistence error.
 	mon := newTestMonitor(now, "https://example.com/health?token=supersecret123", 60)
 	st := newFakeDueStore(mon)
+	st.clock = func() time.Time { return now }
 	st.recordErr = errors.New("pq: transaction commit failed")
 
 	attemptCh := make(chan struct{}, 10)
@@ -640,6 +717,7 @@ func TestScheduler_GracefulShutdownAndBoundedTimeout(t *testing.T) {
 		now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
 		mon := newTestMonitor(now, "https://example.com/slow", 60)
 		st := newFakeDueStore(mon)
+		st.clock = func() time.Time { return now }
 
 		checkStarted := make(chan struct{})
 		releaseCheck := make(chan struct{})
@@ -708,6 +786,7 @@ func TestScheduler_GracefulShutdownAndBoundedTimeout(t *testing.T) {
 		now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
 		mon := newTestMonitor(now, "https://example.com/hung", 60)
 		st := newFakeDueStore(mon)
+		st.clock = func() time.Time { return now }
 
 		checkStarted := make(chan struct{})
 		chk := fakeChecker{
@@ -756,10 +835,13 @@ func TestScheduler_GracefulShutdownAndBoundedTimeout(t *testing.T) {
 			t.Fatal("scheduler.Run blocked past bounded shutdown timeout")
 		}
 
-		// Aborted check must not persist a synthetic failure; monitor stays due on restart.
+		// Aborted check must not persist a synthetic failure; monitor claim is released and stays due on restart.
 		snap, count, _ := st.snapshot(mon.ID)
 		if count != 0 || !snap.NextCheckAt.Equal(now) {
 			t.Fatalf("expected aborted check not to persist or advance next_check_at: count=%d next=%v", count, snap.NextCheckAt)
+		}
+		if _, active := st.hasClaim(mon.ID); active {
+			t.Fatal("expected aborted check's claim to be released on shutdown")
 		}
 		if sched.InFlight().Len() != 0 {
 			t.Fatalf("expected InFlightSet empty, got %d", sched.InFlight().Len())
@@ -771,6 +853,7 @@ func TestScheduler_GracefulShutdownAndBoundedTimeout(t *testing.T) {
 		mon1 := newTestMonitor(now.Add(-2*time.Second), "https://example.com/drain1", 60)
 		mon2 := newTestMonitor(now.Add(-1*time.Second), "https://example.com/drain2", 60)
 		st := newFakeDueStore(mon1, mon2)
+		st.clock = func() time.Time { return now }
 		ordered := &orderedDueStore{fakeDueStore: st, order: []uuid.UUID{mon1.ID, mon2.ID}}
 
 		firstStarted := make(chan struct{})
@@ -802,9 +885,9 @@ func TestScheduler_GracefulShutdownAndBoundedTimeout(t *testing.T) {
 			ordered,
 			chk,
 			slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
-			scheduler.WithWorkerCount(1),
+			scheduler.WithWorkerCount(2),
 			scheduler.WithQueueCapacity(5),
-			scheduler.WithPollInterval(10*time.Millisecond),
+			scheduler.WithPollInterval(1*time.Hour),
 			scheduler.WithShutdownTimeout(2*time.Second),
 			scheduler.WithNowFunc(func() time.Time { return now }),
 		)
@@ -813,24 +896,20 @@ func TestScheduler_GracefulShutdownAndBoundedTimeout(t *testing.T) {
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
+
+		// Buffer both tasks into the work queue before Run starts workers.
+		sched.PollOnce(ctx)
+		if !sched.InFlight().Contains(mon1.ID) || !sched.InFlight().Contains(mon2.ID) {
+			cancel()
+			t.Fatal("expected mon1 and mon2 to be queued in-flight")
+		}
+
 		runDone := make(chan error, 1)
 		go func() {
 			runDone <- sched.Run(ctx)
 		}()
 
 		<-firstStarted
-		// Wait until mon2 is also marked in-flight in the buffered queue before canceling.
-		deadline := time.Now().Add(1 * time.Second)
-		for !sched.InFlight().Contains(mon2.ID) {
-			if time.Now().After(deadline) {
-				close(releaseFirst)
-				cancel()
-				<-runDone
-				t.Fatal("timed out waiting for mon2 to be queued in-flight")
-			}
-			time.Sleep(2 * time.Millisecond)
-		}
-
 		cancel()
 		close(releaseFirst)
 
@@ -857,10 +936,10 @@ func TestScheduler_DuplicateInFlightSuppression_WhileQueued(t *testing.T) {
 	mon1 := newTestMonitor(now.Add(-2*time.Second), "https://example.com/blocker", 60)
 	mon2 := newTestMonitor(now.Add(-1*time.Second), "https://example.com/queued", 60)
 	st := newFakeDueStore(mon1, mon2)
+	st.clock = func() time.Time { return now }
 	ordered := &orderedDueStore{fakeDueStore: st, order: []uuid.UUID{mon1.ID, mon2.ID}}
+	ordered.ignoreClaimLock = true
 
-	mon1Started := make(chan struct{})
-	releaseMon1 := make(chan struct{})
 	var mon2Runs atomic.Int32
 	doneCh := make(chan uuid.UUID, 5)
 	ordered.onRecordHook = func(p store.RecordCheckParams) {
@@ -869,10 +948,7 @@ func TestScheduler_DuplicateInFlightSuppression_WhileQueued(t *testing.T) {
 
 	chk := fakeChecker{
 		fn: func(ctx context.Context, target *checker.Target, timeout time.Duration) checker.CheckObservation {
-			if strings.HasSuffix(target.RawURL(), "/blocker") {
-				close(mon1Started)
-				<-releaseMon1
-			} else {
+			if strings.HasSuffix(target.RawURL(), "/queued") {
 				mon2Runs.Add(1)
 			}
 			s := http.StatusOK
@@ -890,7 +966,7 @@ func TestScheduler_DuplicateInFlightSuppression_WhileQueued(t *testing.T) {
 		ordered,
 		chk,
 		slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
-		scheduler.WithWorkerCount(1),
+		scheduler.WithWorkerCount(3),
 		scheduler.WithQueueCapacity(10),
 		scheduler.WithPollInterval(1*time.Hour),
 		scheduler.WithNowFunc(func() time.Time { return now }),
@@ -900,20 +976,22 @@ func TestScheduler_DuplicateInFlightSuppression_WhileQueued(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// Poll 1 before Run: buffers mon1 and mon2 into queue (freeSlots=3 -> claims 2, inFlight=2).
+	sched.PollOnce(ctx)
+	// Poll 2 while mon1 and mon2 are still sitting in queue (freeSlots=1): duplicate must be suppressed!
+	// Temporarily set ignoreClaimLock=false before Run so original tokens remain valid for persistence.
+	ordered.order = []uuid.UUID{mon2.ID}
+	sched.PollOnce(ctx)
+	ordered.mu.Lock()
+	ordered.ignoreClaimLock = false
+	ordered.mu.Unlock()
+
 	runDone := make(chan error, 1)
 	go func() {
 		runDone <- sched.Run(ctx)
 	}()
 
-	// Poll 1: dispatches mon1 (starts on sole worker) and mon2 (waits in queue).
-	sched.PollOnce(ctx)
-	<-mon1Started
-
-	// Poll 2 while mon2 is still sitting in queue: mon2 must be deduplicated!
-	sched.PollOnce(ctx)
-	sched.PollOnce(ctx)
-
-	close(releaseMon1)
 	for i := 0; i < 2; i++ {
 		<-doneCh
 	}
@@ -930,14 +1008,12 @@ func TestScheduler_DuplicateInFlightSuppression_WhileQueued(t *testing.T) {
 
 func TestScheduler_DueOrderingAndQueueFullDeterministic(t *testing.T) {
 	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
-	mon1 := newTestMonitor(now.Add(-3*time.Second), "https://example.com/first", 60)
-	mon2 := newTestMonitor(now.Add(-2*time.Second), "https://example.com/second", 60)
-	mon3 := newTestMonitor(now.Add(-1*time.Second), "https://example.com/third", 60)
-	st := newFakeDueStore(mon1, mon2, mon3)
-	ordered := &orderedDueStore{fakeDueStore: st, order: []uuid.UUID{mon1.ID, mon2.ID, mon3.ID}}
+	mon1 := newTestMonitor(now.Add(-2*time.Second), "https://example.com/first", 60)
+	mon2 := newTestMonitor(now.Add(-1*time.Second), "https://example.com/second", 60)
+	st := newFakeDueStore(mon1, mon2)
+	st.clock = func() time.Time { return now }
+	ordered := &orderedDueStore{fakeDueStore: st, order: []uuid.UUID{mon1.ID, mon2.ID}}
 
-	mon1Started := make(chan struct{})
-	releaseMon1 := make(chan struct{})
 	var mu sync.Mutex
 	var execOrder []uuid.UUID
 	doneCh := make(chan uuid.UUID, 5)
@@ -953,14 +1029,8 @@ func TestScheduler_DueOrderingAndQueueFullDeterministic(t *testing.T) {
 				execOrder = append(execOrder, mon1.ID)
 			case strings.HasSuffix(target.RawURL(), "/second"):
 				execOrder = append(execOrder, mon2.ID)
-			case strings.HasSuffix(target.RawURL(), "/third"):
-				execOrder = append(execOrder, mon3.ID)
 			}
 			mu.Unlock()
-			if strings.HasSuffix(target.RawURL(), "/first") {
-				close(mon1Started)
-				<-releaseMon1
-			}
 			s := http.StatusOK
 			return checker.CheckObservation{
 				CheckedAt:   now,
@@ -976,7 +1046,7 @@ func TestScheduler_DueOrderingAndQueueFullDeterministic(t *testing.T) {
 		ordered,
 		chk,
 		slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
-		scheduler.WithWorkerCount(1),
+		scheduler.WithWorkerCount(2),
 		scheduler.WithQueueCapacity(1),
 		scheduler.WithPollInterval(1*time.Hour),
 		scheduler.WithNowFunc(func() time.Time { return now }),
@@ -986,45 +1056,34 @@ func TestScheduler_DueOrderingAndQueueFullDeterministic(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// Poll 1: claims mon1 (queue cap 1 -> full).
+	sched.PollOnce(ctx)
+	// Poll 2: claims mon2 (freeSlots=1), hits queue full, releases mon2 claim and InFlightSet immediately.
+	sched.PollOnce(ctx)
+
+	if !sched.InFlight().Contains(mon1.ID) {
+		cancel()
+		t.Fatal("expected mon1 to be in-flight")
+	}
+	if sched.InFlight().Contains(mon2.ID) {
+		cancel()
+		t.Fatal("expected mon2 to be released from InFlightSet when queue is full")
+	}
+	if _, active := st.hasClaim(mon2.ID); active {
+		cancel()
+		t.Fatal("expected mon2 DB claim released when queue is full")
+	}
+
 	runDone := make(chan error, 1)
 	go func() {
 		runDone <- sched.Run(ctx)
 	}()
 
-	// Wait until worker is busy? Wait: PollOnce sends mon1, mon2, mon3 synchronously while worker may pick up mon1!
-	// To guarantee mon1 is occupying the worker BEFORE mon2 & mon3 are dispatched, run a two-step deterministic check:
-	// First, enqueue mon1 alone and block worker, then PollOnce with mon2+mon3.
-	ordered.mu.Lock()
-	ordered.order = []uuid.UUID{mon1.ID}
-	ordered.mu.Unlock()
-	sched.PollOnce(ctx)
-	<-mon1Started
-
-	ordered.mu.Lock()
-	ordered.order = []uuid.UUID{mon2.ID, mon3.ID}
-	ordered.mu.Unlock()
-	sched.PollOnce(ctx)
-
-	// mon2 fills queue (cap 1); mon3 hits queue-full and is released from InFlightSet immediately.
-	if !sched.InFlight().Contains(mon1.ID) || !sched.InFlight().Contains(mon2.ID) {
-		close(releaseMon1)
-		cancel()
-		<-runDone
-		t.Fatal("expected mon1 and mon2 to be in-flight")
-	}
-	if sched.InFlight().Contains(mon3.ID) {
-		close(releaseMon1)
-		cancel()
-		<-runDone
-		t.Fatal("expected mon3 to be released from InFlightSet when queue is full")
-	}
-
-	// Unblock mon1 -> mon1 and mon2 finish.
-	close(releaseMon1)
-	<-doneCh
+	// mon1 completes from the buffered queue.
 	<-doneCh
 
-	// Next PollOnce picks up mon3 because its next_check_at remained due.
+	// Next PollOnce picks up mon2 because its claim was released and next_check_at remained due.
 	sched.PollOnce(ctx)
 	<-doneCh
 
@@ -1035,8 +1094,8 @@ func TestScheduler_DueOrderingAndQueueFullDeterministic(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(execOrder) != 3 || execOrder[0] != mon1.ID || execOrder[1] != mon2.ID || execOrder[2] != mon3.ID {
-		t.Fatalf("expected deterministic due execution order [%v, %v, %v], got %v", mon1.ID, mon2.ID, mon3.ID, execOrder)
+	if len(execOrder) != 2 || execOrder[0] != mon1.ID || execOrder[1] != mon2.ID {
+		t.Fatalf("expected deterministic due execution order [%v, %v], got %v", mon1.ID, mon2.ID, execOrder)
 	}
 }
 
@@ -1044,6 +1103,7 @@ func TestScheduler_UnsafeMonitorURLPersistsSanitizedFailure(t *testing.T) {
 	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
 	mon := newTestMonitor(now, "http://127.0.0.1:8080/internal?token=topsecret999", 60)
 	st := newFakeDueStore(mon)
+	st.clock = func() time.Time { return now }
 
 	persisted := make(chan struct{}, 1)
 	st.onRecordHook = func(store.RecordCheckParams) {

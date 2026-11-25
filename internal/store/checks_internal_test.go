@@ -76,6 +76,16 @@ func assignMonitorScan(dest []any, m model.Monitor) error {
 	return nil
 }
 
+func assignMonitorForUpdateScan(dest []any, m model.Monitor, claimToken *uuid.UUID, claimExpiresAt *time.Time, dbNow time.Time) error {
+	if err := assignMonitorScan(dest, m); err != nil {
+		return err
+	}
+	*dest[12].(**uuid.UUID) = claimToken
+	*dest[13].(**time.Time) = claimExpiresAt
+	*dest[14].(*time.Time) = dbNow
+	return nil
+}
+
 func TestRecordCheckResult_NilPoolAndInvalidParams(t *testing.T) {
 	var nilStore *Store
 	if _, err := nilStore.RecordCheckResult(context.Background(), RecordCheckParams{}); err == nil {
@@ -84,30 +94,42 @@ func TestRecordCheckResult_NilPoolAndInvalidParams(t *testing.T) {
 
 	s := New(nil)
 	if _, err := s.RecordCheckResult(context.Background(), RecordCheckParams{
-		MonitorID: uuid.New(),
-		CheckedAt: time.Now().UTC(),
+		MonitorID:  uuid.New(),
+		ClaimToken: uuid.New(),
+		CheckedAt:  time.Now().UTC(),
 	}); err == nil {
 		t.Fatal("expected error for nil pool")
 	}
 
 	if _, err := s.recordCheckResultTx(context.Background(), &fakeCheckTx{}, RecordCheckParams{
-		MonitorID: uuid.Nil,
-		CheckedAt: time.Now().UTC(),
+		MonitorID:  uuid.Nil,
+		ClaimToken: uuid.New(),
+		CheckedAt:  time.Now().UTC(),
 	}, nil); err == nil {
 		t.Fatal("expected error for nil monitor_id")
 	}
 
 	if _, err := s.recordCheckResultTx(context.Background(), &fakeCheckTx{}, RecordCheckParams{
-		MonitorID: uuid.New(),
-		CheckedAt: time.Time{},
+		MonitorID:  uuid.New(),
+		ClaimToken: uuid.Nil,
+		CheckedAt:  time.Now().UTC(),
+	}, nil); !errors.Is(err, ErrClaimLost) {
+		t.Fatalf("expected ErrClaimLost for nil claim_token, got %v", err)
+	}
+
+	if _, err := s.recordCheckResultTx(context.Background(), &fakeCheckTx{}, RecordCheckParams{
+		MonitorID:  uuid.New(),
+		ClaimToken: uuid.New(),
+		CheckedAt:  time.Time{},
 	}, nil); !errors.Is(err, model.ErrZeroCheckedAt) {
 		t.Fatalf("expected ErrZeroCheckedAt, got %v", err)
 	}
 
 	if _, err := s.recordCheckResultTx(context.Background(), &fakeCheckTx{}, RecordCheckParams{
-		MonitorID: uuid.New(),
-		CheckedAt: time.Now().UTC(),
-		LatencyMs: -1,
+		MonitorID:  uuid.New(),
+		ClaimToken: uuid.New(),
+		CheckedAt:  time.Now().UTC(),
+		LatencyMs:  -1,
 	}, nil); err == nil {
 		t.Fatal("expected error for negative latency_ms")
 	}
@@ -124,9 +146,10 @@ func TestRecordCheckResultTx_RollsBackWhenMonitorNotFound(t *testing.T) {
 	}
 
 	_, err := s.recordCheckResultTx(context.Background(), tx, RecordCheckParams{
-		MonitorID: uuid.New(),
-		CheckedAt: time.Now().UTC(),
-		Success:   true,
+		MonitorID:  uuid.New(),
+		ClaimToken: uuid.New(),
+		CheckedAt:  time.Now().UTC(),
+		Success:    true,
 	}, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
@@ -142,16 +165,106 @@ func TestRecordCheckResultTx_RollsBackWhenMonitorNotFound(t *testing.T) {
 	}
 }
 
-func TestRecordCheckResultTx_RollsBackOnInsertFailure(t *testing.T) {
+func TestRecordCheckResultTx_RollsBackOnClaimLoss(t *testing.T) {
 	s := New(nil)
 	monitorID := uuid.New()
 	now := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+	token := uuid.New()
+	otherToken := uuid.New()
+	activeExpiry := now.Add(35 * time.Second)
+	expiredExpiry := now.Add(-1 * time.Second)
+
+	cases := []struct {
+		name           string
+		storedToken    *uuid.UUID
+		storedExpiry   *time.Time
+		expectedErrSub string
+	}{
+		{
+			name:           "missing claim on monitor row",
+			storedToken:    nil,
+			storedExpiry:   nil,
+			expectedErrSub: "no active claim",
+		},
+		{
+			name:           "stale mismatched claim token",
+			storedToken:    &otherToken,
+			storedExpiry:   &activeExpiry,
+			expectedErrSub: "mismatch",
+		},
+		{
+			name:           "expired claim lease",
+			storedToken:    &token,
+			storedExpiry:   &expiredExpiry,
+			expectedErrSub: "expired",
+		},
+		{
+			name:           "exact boundary claim expiry",
+			storedToken:    &token,
+			storedExpiry:   &now,
+			expectedErrSub: "expired",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tx := &fakeCheckTx{
+				queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+					if strings.Contains(sql, "SELECT id, name") {
+						return fakeRow{scanFunc: func(dest ...any) error {
+							return assignMonitorForUpdateScan(dest, model.Monitor{
+								ID:              monitorID,
+								Name:            "API",
+								URL:             "https://example.com",
+								IntervalSeconds: 60,
+								TimeoutSeconds:  5,
+								CurrentStatus:   model.StatusUnknown,
+								NextCheckAt:     now,
+								CreatedAt:       now,
+								UpdatedAt:       now,
+							}, tc.storedToken, tc.storedExpiry, now)
+						}}
+					}
+					t.Fatalf("expected no INSERT or UPDATE after claim loss, got SQL: %s", sql)
+					return nil
+				},
+			}
+
+			_, err := s.recordCheckResultTx(context.Background(), tx, RecordCheckParams{
+				MonitorID:  monitorID,
+				ClaimToken: token,
+				CheckedAt:  now,
+				Success:    true,
+				LatencyMs:  10,
+			}, nil)
+			if !errors.Is(err, ErrClaimLost) || !strings.Contains(err.Error(), tc.expectedErrSub) {
+				t.Fatalf("expected ErrClaimLost (%s), got %v", tc.expectedErrSub, err)
+			}
+			if tx.commitCount != 0 {
+				t.Errorf("expected 0 commits, got %d", tx.commitCount)
+			}
+			if tx.rollbackCnt != 1 {
+				t.Errorf("expected 1 rollback, got %d", tx.rollbackCnt)
+			}
+			if len(tx.calls) != 1 {
+				t.Errorf("expected only SELECT FOR UPDATE to run, got %d calls", len(tx.calls))
+			}
+		})
+	}
+}
+
+func TestRecordCheckResultTx_RollsBackOnInsertFailure(t *testing.T) {
+	s := New(nil)
+	monitorID := uuid.New()
+	claimToken := uuid.New()
+	now := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+	expiry := now.Add(35 * time.Second)
 
 	tx := &fakeCheckTx{
 		queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
 			if strings.Contains(sql, "SELECT id, name") {
 				return fakeRow{scanFunc: func(dest ...any) error {
-					return assignMonitorScan(dest, model.Monitor{
+					return assignMonitorForUpdateScan(dest, model.Monitor{
 						ID:              monitorID,
 						Name:            "API",
 						URL:             "https://example.com",
@@ -161,7 +274,7 @@ func TestRecordCheckResultTx_RollsBackOnInsertFailure(t *testing.T) {
 						NextCheckAt:     now,
 						CreatedAt:       now,
 						UpdatedAt:       now,
-					})
+					}, &claimToken, &expiry, now)
 				}}
 			}
 			if strings.Contains(sql, "INSERT INTO check_results") {
@@ -175,11 +288,11 @@ func TestRecordCheckResultTx_RollsBackOnInsertFailure(t *testing.T) {
 	}
 
 	_, err := s.recordCheckResultTx(context.Background(), tx, RecordCheckParams{
-		MonitorID:   monitorID,
-		CheckedAt:   now,
-		CompletedAt: now.Add(50 * time.Millisecond),
-		Success:     true,
-		LatencyMs:   50,
+		MonitorID:  monitorID,
+		ClaimToken: claimToken,
+		CheckedAt:  now,
+		Success:    true,
+		LatencyMs:  50,
 	}, nil)
 	if err == nil || !strings.Contains(err.Error(), "insert check_results failed") {
 		t.Fatalf("expected insert failure error, got %v", err)
@@ -198,7 +311,9 @@ func TestRecordCheckResultTx_RollsBackOnInsertFailure(t *testing.T) {
 func TestRecordCheckResultTx_RollsBackOnUpdateFailure(t *testing.T) {
 	s := New(nil)
 	monitorID := uuid.New()
+	claimToken := uuid.New()
 	now := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+	expiry := now.Add(35 * time.Second)
 	statusCode := 503
 	errText := "HTTP status 503 Service Unavailable"
 
@@ -206,7 +321,7 @@ func TestRecordCheckResultTx_RollsBackOnUpdateFailure(t *testing.T) {
 		queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
 			if strings.Contains(sql, "SELECT id, name") {
 				return fakeRow{scanFunc: func(dest ...any) error {
-					return assignMonitorScan(dest, model.Monitor{
+					return assignMonitorForUpdateScan(dest, model.Monitor{
 						ID:              monitorID,
 						Name:            "API",
 						URL:             "https://example.com",
@@ -216,7 +331,7 @@ func TestRecordCheckResultTx_RollsBackOnUpdateFailure(t *testing.T) {
 						NextCheckAt:     now,
 						CreatedAt:       now,
 						UpdatedAt:       now,
-					})
+					}, &claimToken, &expiry, now)
 				}}
 			}
 			if strings.Contains(sql, "INSERT INTO check_results") {
@@ -243,8 +358,8 @@ func TestRecordCheckResultTx_RollsBackOnUpdateFailure(t *testing.T) {
 
 	_, err := s.recordCheckResultTx(context.Background(), tx, RecordCheckParams{
 		MonitorID:    monitorID,
+		ClaimToken:   claimToken,
 		CheckedAt:    now,
-		CompletedAt:  now.Add(120 * time.Millisecond),
 		Success:      false,
 		HTTPStatus:   &statusCode,
 		LatencyMs:    120,
@@ -264,17 +379,18 @@ func TestRecordCheckResultTx_RollsBackOnUpdateFailure(t *testing.T) {
 	}
 }
 
-func TestRecordCheckResultTx_RollsBackOnCommitFailure(t *testing.T) {
+func TestRecordCheckResultTx_RollsBackWhenConditionalUpdateReturnsNoRows(t *testing.T) {
 	s := New(nil)
 	monitorID := uuid.New()
+	claimToken := uuid.New()
 	now := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+	expiry := now.Add(35 * time.Second)
 
 	tx := &fakeCheckTx{
-		commitErr: errors.New("commit failed"),
 		queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
 			if strings.Contains(sql, "SELECT id, name") {
 				return fakeRow{scanFunc: func(dest ...any) error {
-					return assignMonitorScan(dest, model.Monitor{
+					return assignMonitorForUpdateScan(dest, model.Monitor{
 						ID:              monitorID,
 						Name:            "API",
 						URL:             "https://example.com",
@@ -284,7 +400,72 @@ func TestRecordCheckResultTx_RollsBackOnCommitFailure(t *testing.T) {
 						NextCheckAt:     now,
 						CreatedAt:       now,
 						UpdatedAt:       now,
-					})
+					}, &claimToken, &expiry, now)
+				}}
+			}
+			if strings.Contains(sql, "INSERT INTO check_results") {
+				return fakeRow{scanFunc: func(dest ...any) error {
+					*dest[0].(*uuid.UUID) = args[0].(uuid.UUID)
+					*dest[1].(*uuid.UUID) = args[1].(uuid.UUID)
+					*dest[2].(*time.Time) = args[2].(time.Time)
+					*dest[3].(*bool) = args[3].(bool)
+					*dest[4].(**int) = args[4].(*int)
+					*dest[5].(*int64) = args[5].(int64)
+					*dest[6].(**string) = args[6].(*string)
+					return nil
+				}}
+			}
+			if strings.Contains(sql, "UPDATE monitors") {
+				return fakeRow{scanFunc: func(dest ...any) error {
+					return pgx.ErrNoRows
+				}}
+			}
+			t.Fatalf("unexpected SQL: %s", sql)
+			return nil
+		},
+	}
+
+	_, err := s.recordCheckResultTx(context.Background(), tx, RecordCheckParams{
+		MonitorID:  monitorID,
+		ClaimToken: claimToken,
+		CheckedAt:  now,
+		Success:    true,
+		LatencyMs:  10,
+	}, nil)
+	if !errors.Is(err, ErrClaimLost) {
+		t.Fatalf("expected ErrClaimLost when conditional UPDATE matches 0 rows, got %v", err)
+	}
+	if tx.commitCount != 0 {
+		t.Errorf("expected 0 commits, got %d", tx.commitCount)
+	}
+	if tx.rollbackCnt != 1 {
+		t.Errorf("expected 1 rollback, got %d", tx.rollbackCnt)
+	}
+}
+
+func TestRecordCheckResultTx_RollsBackOnCommitFailure(t *testing.T) {
+	s := New(nil)
+	monitorID := uuid.New()
+	claimToken := uuid.New()
+	now := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+	expiry := now.Add(35 * time.Second)
+
+	tx := &fakeCheckTx{
+		commitErr: errors.New("commit failed"),
+		queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			if strings.Contains(sql, "SELECT id, name") {
+				return fakeRow{scanFunc: func(dest ...any) error {
+					return assignMonitorForUpdateScan(dest, model.Monitor{
+						ID:              monitorID,
+						Name:            "API",
+						URL:             "https://example.com",
+						IntervalSeconds: 60,
+						TimeoutSeconds:  5,
+						CurrentStatus:   model.StatusUnknown,
+						NextCheckAt:     now,
+						CreatedAt:       now,
+						UpdatedAt:       now,
+					}, &claimToken, &expiry, now)
 				}}
 			}
 			if strings.Contains(sql, "INSERT INTO check_results") {
@@ -311,9 +492,9 @@ func TestRecordCheckResultTx_RollsBackOnCommitFailure(t *testing.T) {
 						ConsecutiveFailures: args[2].(int),
 						LastCheckedAt:       args[3].(*time.Time),
 						LastSuccessAt:       args[4].(*time.Time),
-						NextCheckAt:         args[5].(time.Time),
+						NextCheckAt:         now.Add(60 * time.Second),
 						CreatedAt:           now,
-						UpdatedAt:           args[6].(time.Time),
+						UpdatedAt:           now,
 					})
 				}}
 			}
@@ -323,11 +504,11 @@ func TestRecordCheckResultTx_RollsBackOnCommitFailure(t *testing.T) {
 	}
 
 	_, err := s.recordCheckResultTx(context.Background(), tx, RecordCheckParams{
-		MonitorID:   monitorID,
-		CheckedAt:   now,
-		CompletedAt: now.Add(20 * time.Millisecond),
-		Success:     true,
-		LatencyMs:   20,
+		MonitorID:  monitorID,
+		ClaimToken: claimToken,
+		CheckedAt:  now,
+		Success:    true,
+		LatencyMs:  20,
 	}, nil)
 	if err == nil || !strings.Contains(err.Error(), "commit failed") {
 		t.Fatalf("expected commit error, got %v", err)
@@ -343,15 +524,20 @@ func TestRecordCheckResultTx_RollsBackOnCommitFailure(t *testing.T) {
 func TestRecordCheckResultTx_ParameterizedSQLAndCommit(t *testing.T) {
 	s := New(nil)
 	monitorID := uuid.New()
+	claimToken := uuid.New()
 	checkedAt := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
-	completedAt := checkedAt.Add(350 * time.Millisecond)
+	dbUpdateClock := checkedAt.Add(5 * time.Second)
+	expiry := checkedAt.Add(35 * time.Second)
 	statusCode := 200
 
 	tx := &fakeCheckTx{
 		queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
 			if strings.Contains(sql, "SELECT id, name") {
+				if !strings.Contains(sql, "clock_timestamp()") {
+					t.Errorf("expected SELECT ... FOR UPDATE to use clock_timestamp(), got: %s", sql)
+				}
 				return fakeRow{scanFunc: func(dest ...any) error {
-					return assignMonitorScan(dest, model.Monitor{
+					return assignMonitorForUpdateScan(dest, model.Monitor{
 						ID:                  monitorID,
 						Name:                "API",
 						URL:                 "https://example.com",
@@ -362,7 +548,7 @@ func TestRecordCheckResultTx_ParameterizedSQLAndCommit(t *testing.T) {
 						NextCheckAt:         checkedAt,
 						CreatedAt:           checkedAt.Add(-5 * time.Minute),
 						UpdatedAt:           checkedAt.Add(-time.Minute),
-					})
+					}, &claimToken, &expiry, checkedAt)
 				}}
 			}
 			if strings.Contains(sql, "INSERT INTO check_results") {
@@ -378,6 +564,27 @@ func TestRecordCheckResultTx_ParameterizedSQLAndCommit(t *testing.T) {
 				}}
 			}
 			if strings.Contains(sql, "UPDATE monitors") {
+				if !strings.Contains(sql, "db_clock AS MATERIALIZED") || !strings.Contains(sql, "clock_timestamp() AS current_time") {
+					t.Errorf("expected UPDATE monitors to use materialized clock_timestamp() CTE, got: %s", sql)
+				}
+				if !strings.Contains(sql, "next_check_at = db_clock.current_time + make_interval(secs => m.interval_seconds)") {
+					t.Errorf("expected next_check_at computed from db_clock.current_time + interval_seconds, got: %s", sql)
+				}
+				if !strings.Contains(sql, "updated_at = db_clock.current_time") {
+					t.Errorf("expected updated_at set to db_clock.current_time, got: %s", sql)
+				}
+				if !strings.Contains(sql, "claim_token = NULL") || !strings.Contains(sql, "claim_expires_at = NULL") {
+					t.Errorf("expected UPDATE monitors to clear claim_token and claim_expires_at, got: %s", sql)
+				}
+				if !strings.Contains(sql, "AND m.claim_token = $6") {
+					t.Errorf("expected UPDATE monitors to fence on m.claim_token = $6, got: %s", sql)
+				}
+				if !strings.Contains(sql, "AND m.claim_expires_at > db_clock.current_time") {
+					t.Errorf("expected UPDATE monitors to verify m.claim_expires_at > db_clock.current_time, got: %s", sql)
+				}
+				if len(args) != 6 || args[5].(uuid.UUID) != claimToken {
+					t.Errorf("expected 6 args with $6=claimToken %v, got %v", claimToken, args)
+				}
 				return fakeRow{scanFunc: func(dest ...any) error {
 					return assignMonitorScan(dest, model.Monitor{
 						ID:                  monitorID,
@@ -389,9 +596,9 @@ func TestRecordCheckResultTx_ParameterizedSQLAndCommit(t *testing.T) {
 						ConsecutiveFailures: args[2].(int),
 						LastCheckedAt:       args[3].(*time.Time),
 						LastSuccessAt:       args[4].(*time.Time),
-						NextCheckAt:         args[5].(time.Time),
+						NextCheckAt:         dbUpdateClock.Add(90 * time.Second),
 						CreatedAt:           checkedAt.Add(-5 * time.Minute),
-						UpdatedAt:           args[6].(time.Time),
+						UpdatedAt:           dbUpdateClock,
 					})
 				}}
 			}
@@ -401,12 +608,12 @@ func TestRecordCheckResultTx_ParameterizedSQLAndCommit(t *testing.T) {
 	}
 
 	out, err := s.recordCheckResultTx(context.Background(), tx, RecordCheckParams{
-		MonitorID:   monitorID,
-		CheckedAt:   checkedAt,
-		CompletedAt: completedAt,
-		Success:     true,
-		HTTPStatus:  &statusCode,
-		LatencyMs:   350,
+		MonitorID:  monitorID,
+		ClaimToken: claimToken,
+		CheckedAt:  checkedAt,
+		Success:    true,
+		HTTPStatus: &statusCode,
+		LatencyMs:  350,
 	}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -429,7 +636,10 @@ func TestRecordCheckResultTx_ParameterizedSQLAndCommit(t *testing.T) {
 	if out.Monitor.LastSuccessAt == nil || !out.Monitor.LastSuccessAt.Equal(checkedAt) {
 		t.Errorf("expected last_success_at %v, got %v", checkedAt, out.Monitor.LastSuccessAt)
 	}
-	wantNext := completedAt.Add(90 * time.Second)
+	if !out.Monitor.UpdatedAt.Equal(dbUpdateClock) {
+		t.Errorf("expected updated_at %v, got %v", dbUpdateClock, out.Monitor.UpdatedAt)
+	}
+	wantNext := dbUpdateClock.Add(90 * time.Second)
 	if !out.Monitor.NextCheckAt.Equal(wantNext) {
 		t.Errorf("expected next_check_at %v, got %v", wantNext, out.Monitor.NextCheckAt)
 	}
@@ -441,14 +651,16 @@ func TestRecordCheckResultTx_ParameterizedSQLAndCommit(t *testing.T) {
 func TestRecordCheckResultTx_RollsBackAfterInsertHookAndUsesUncanceledRollbackCtx(t *testing.T) {
 	s := New(nil)
 	monitorID := uuid.New()
+	claimToken := uuid.New()
 	now := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+	expiry := now.Add(35 * time.Second)
 
 	t.Run("rolls back before UPDATE when afterInsert hook fails", func(t *testing.T) {
 		tx := &fakeCheckTx{
 			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
 				if strings.Contains(sql, "SELECT id, name") {
 					return fakeRow{scanFunc: func(dest ...any) error {
-						return assignMonitorScan(dest, model.Monitor{
+						return assignMonitorForUpdateScan(dest, model.Monitor{
 							ID:              monitorID,
 							Name:            "API",
 							URL:             "https://example.com",
@@ -458,7 +670,7 @@ func TestRecordCheckResultTx_RollsBackAfterInsertHookAndUsesUncanceledRollbackCt
 							NextCheckAt:     now,
 							CreatedAt:       now,
 							UpdatedAt:       now,
-						})
+						}, &claimToken, &expiry, now)
 					}}
 				}
 				if strings.Contains(sql, "INSERT INTO check_results") {
@@ -480,11 +692,11 @@ func TestRecordCheckResultTx_RollsBackAfterInsertHookAndUsesUncanceledRollbackCt
 
 		ctx, cancel := context.WithCancel(context.Background())
 		_, err := s.recordCheckResultTx(ctx, tx, RecordCheckParams{
-			MonitorID:   monitorID,
-			CheckedAt:   now,
-			CompletedAt: now.Add(10 * time.Millisecond),
-			Success:     true,
-			LatencyMs:   10,
+			MonitorID:  monitorID,
+			ClaimToken: claimToken,
+			CheckedAt:  now,
+			Success:    true,
+			LatencyMs:  10,
 		}, func(ctx context.Context, _ checkTx) error {
 			// Cancel caller context and return an error to verify Rollback still receives a live context.
 			cancel()
@@ -508,7 +720,7 @@ func TestRecordCheckResultTx_RollsBackAfterInsertHookAndUsesUncanceledRollbackCt
 			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
 				if strings.Contains(sql, "SELECT id, name") {
 					return fakeRow{scanFunc: func(dest ...any) error {
-						return assignMonitorScan(dest, model.Monitor{
+						return assignMonitorForUpdateScan(dest, model.Monitor{
 							ID:              monitorID,
 							Name:            "API",
 							URL:             "https://example.com",
@@ -518,7 +730,7 @@ func TestRecordCheckResultTx_RollsBackAfterInsertHookAndUsesUncanceledRollbackCt
 							NextCheckAt:     now,
 							CreatedAt:       now,
 							UpdatedAt:       now,
-						})
+						}, &claimToken, &expiry, now)
 					}}
 				}
 				if strings.Contains(sql, "INSERT INTO check_results") {
@@ -545,9 +757,9 @@ func TestRecordCheckResultTx_RollsBackAfterInsertHookAndUsesUncanceledRollbackCt
 						ConsecutiveFailures: args[2].(int),
 						LastCheckedAt:       args[3].(*time.Time),
 						LastSuccessAt:       args[4].(*time.Time),
-						NextCheckAt:         args[5].(time.Time),
+						NextCheckAt:         now.Add(60 * time.Second),
 						CreatedAt:           now,
-						UpdatedAt:           args[6].(time.Time),
+						UpdatedAt:           now,
 					})
 				}}
 			},
@@ -555,8 +767,8 @@ func TestRecordCheckResultTx_RollsBackAfterInsertHookAndUsesUncanceledRollbackCt
 
 		out, err := s.recordCheckResultTx(context.Background(), tx, RecordCheckParams{
 			MonitorID:    monitorID,
+			ClaimToken:   claimToken,
 			CheckedAt:    now,
-			CompletedAt:  now,
 			Success:      false,
 			LatencyMs:    25,
 			ErrorMessage: &longErr,

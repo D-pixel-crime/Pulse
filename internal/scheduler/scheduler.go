@@ -16,11 +16,15 @@ import (
 	"pulse/internal/store"
 )
 
-const defaultShutdownTimeout = 5 * time.Second
+const (
+	defaultShutdownTimeout = 5 * time.Second
+	defaultReleaseTimeout  = 5 * time.Second
+)
 
 // DueMonitorStore defines the persistence operations required by the scheduler and workers.
 type DueMonitorStore interface {
-	ListDueMonitors(ctx context.Context, now time.Time, limit int) ([]*model.Monitor, error)
+	ClaimDueMonitors(ctx context.Context, limit int) ([]model.ClaimedMonitor, error)
+	ReleaseClaim(ctx context.Context, monitorID, claimToken uuid.UUID) (bool, error)
 	RecordCheckResult(ctx context.Context, params store.RecordCheckParams) (*store.RecordCheckOutput, error)
 }
 
@@ -29,13 +33,14 @@ type HealthChecker interface {
 	Check(ctx context.Context, target *checker.Target, timeout time.Duration) checker.CheckObservation
 }
 
-// Scheduler polls due monitors on a fixed interval, suppresses concurrent duplicate
-// dispatches with an in-memory InFlightSet, and dispatches work to a fixed-size worker pool.
+// Scheduler polls due monitors on a fixed interval, claims them in PostgreSQL with
+// temporary leases, suppresses local duplicate dispatches with an in-memory InFlightSet,
+// and dispatches work to a fixed-size worker pool.
 type Scheduler struct {
 	store           DueMonitorStore
 	checker         HealthChecker
 	inFlight        *InFlightSet
-	pool            *WorkerPool[*model.Monitor]
+	pool            *WorkerPool[model.ClaimedMonitor]
 	workerCount     int
 	queueCapacity   int
 	pollInterval    time.Duration
@@ -143,7 +148,7 @@ func New(dueStore DueMonitorStore, healthChecker HealthChecker, logger *slog.Log
 		s.batchLimit = store.MaxDueBatchLimit
 	}
 
-	pool, err := NewWorkerPool[*model.Monitor](s.workerCount, s.queueCapacity, s.handleMonitor)
+	pool, err := NewWorkerPool[model.ClaimedMonitor](s.workerCount, s.queueCapacity, s.handleMonitor)
 	if err != nil {
 		return nil, fmt.Errorf("invalid scheduler worker pool configuration: %w", err)
 	}
@@ -212,47 +217,73 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	return nil
 }
 
-// PollOnce executes one bounded due-monitor query and dispatches eligible monitors to the work queue.
+// PollOnce calculates local free execution slots, claims a bounded batch of due monitors
+// from PostgreSQL, and dispatches eligible claimed tasks to the work queue.
 func (s *Scheduler) PollOnce(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
 
-	monitors, err := s.store.ListDueMonitors(ctx, s.now().UTC(), s.batchLimit)
+	freeSlots := s.workerCount - s.inFlight.Len()
+	if freeSlots <= 0 {
+		return
+	}
+
+	claimLimit := freeSlots
+	if s.batchLimit > 0 && s.batchLimit < claimLimit {
+		claimLimit = s.batchLimit
+	}
+	if s.queueCapacity > 0 && s.queueCapacity < claimLimit {
+		claimLimit = s.queueCapacity
+	}
+
+	claimed, err := s.store.ClaimDueMonitors(ctx, claimLimit)
 	if err != nil {
 		if ctx.Err() == nil {
-			s.logger.Error("failed to query due monitors", slog.String("error", err.Error()))
+			s.logger.Error("failed to claim due monitors", slog.String("error", err.Error()))
 		}
 		return
 	}
 
-	for _, m := range monitors {
+	for i, cm := range claimed {
 		if ctx.Err() != nil {
+			for j := i; j < len(claimed); j++ {
+				rem := claimed[j]
+				if rem.Monitor != nil && rem.Monitor.ID != uuid.Nil {
+					s.releaseClaim(rem.Monitor.ID, rem.ClaimToken, sanitizeURLForLog(rem.Monitor.URL), nil)
+				}
+			}
 			return
 		}
-		if m == nil || m.ID == uuid.Nil {
+		if cm.Monitor == nil || cm.Monitor.ID == uuid.Nil {
 			continue
 		}
-		if !s.inFlight.TryAdd(m.ID) {
+		sanitizedURL := sanitizeURLForLog(cm.Monitor.URL)
+		if !s.inFlight.TryAdd(cm.Monitor.ID) {
+			s.releaseClaim(cm.Monitor.ID, cm.ClaimToken, sanitizedURL, nil)
 			continue
 		}
-		if !s.pool.TryEnqueue(m) {
-			s.inFlight.Remove(m.ID)
+		if !s.pool.TryEnqueue(cm) {
+			s.inFlight.Remove(cm.Monitor.ID)
+			s.releaseClaim(cm.Monitor.ID, cm.ClaimToken, sanitizedURL, nil)
 			s.logger.Warn("work queue full; releasing monitor for retry on next tick",
-				slog.String("monitor_id", m.ID.String()),
-				slog.String("url", sanitizeURLForLog(m.URL)),
+				slog.String("monitor_id", cm.Monitor.ID.String()),
+				slog.String("url", sanitizedURL),
 			)
 		}
 	}
 }
 
-func (s *Scheduler) handleMonitor(ctx context.Context, m *model.Monitor) {
-	if m == nil {
+func (s *Scheduler) handleMonitor(ctx context.Context, cm model.ClaimedMonitor) {
+	if cm.Monitor == nil || cm.Monitor.ID == uuid.Nil {
 		return
 	}
+	m := cm.Monitor
 	defer s.inFlight.Remove(m.ID)
 
+	sanitizedURL := sanitizeURLForLog(m.URL)
 	if ctx.Err() != nil {
+		s.releaseClaim(m.ID, cm.ClaimToken, sanitizedURL, nil)
 		return
 	}
 
@@ -260,9 +291,8 @@ func (s *Scheduler) handleMonitor(ctx context.Context, m *model.Monitor) {
 	if err != nil {
 		now := s.now().UTC()
 		errMsg := checker.SanitizeErrorMessage(err.Error(), nil)
-		s.persistObservation(ctx, m.ID, nil, m.URL, checker.CheckObservation{
+		s.persistObservation(ctx, m.ID, cm.ClaimToken, nil, m.URL, checker.CheckObservation{
 			CheckedAt:    now,
-			CompletedAt:  now,
 			Success:      false,
 			HTTPStatus:   nil,
 			Latency:      0,
@@ -278,19 +308,21 @@ func (s *Scheduler) handleMonitor(ctx context.Context, m *model.Monitor) {
 
 	obs := s.checker.Check(ctx, target, timeout)
 	if ctx.Err() != nil {
-		s.logger.Info("check aborted due to worker shutdown; leaving monitor due",
+		s.logger.Info("check aborted due to worker shutdown; releasing claim",
 			slog.String("monitor_id", m.ID.String()),
 			slog.String("url", target.SanitizedURL()),
 		)
+		s.releaseClaim(m.ID, cm.ClaimToken, target.SanitizedURL(), target)
 		return
 	}
 
-	s.persistObservation(ctx, m.ID, target, m.URL, obs)
+	s.persistObservation(ctx, m.ID, cm.ClaimToken, target, m.URL, obs)
 }
 
 func (s *Scheduler) persistObservation(
 	ctx context.Context,
 	monitorID uuid.UUID,
+	claimToken uuid.UUID,
 	target *checker.Target,
 	rawURL string,
 	obs checker.CheckObservation,
@@ -302,8 +334,8 @@ func (s *Scheduler) persistObservation(
 
 	out, err := s.store.RecordCheckResult(ctx, store.RecordCheckParams{
 		MonitorID:    monitorID,
+		ClaimToken:   claimToken,
 		CheckedAt:    obs.CheckedAt,
-		CompletedAt:  obs.CompletedAt,
 		Success:      obs.Success,
 		HTTPStatus:   obs.HTTPStatus,
 		LatencyMs:    obs.LatencyMs(),
@@ -316,12 +348,20 @@ func (s *Scheduler) persistObservation(
 			)
 			return
 		}
-		s.logger.Error("failed to persist check result; leaving monitor due for retry",
+		if errors.Is(err, store.ErrClaimLost) {
+			s.logger.Warn("monitor claim lost before check persistence; skipping",
+				slog.String("monitor_id", monitorID.String()),
+				slog.String("url", sanitizedTarget),
+			)
+			return
+		}
+		s.logger.Error("failed to persist check result; releasing claim for retry",
 			slog.String("monitor_id", monitorID.String()),
 			slog.String("url", sanitizedTarget),
 			slog.Bool("success", obs.Success),
 			slog.String("error", checker.SanitizeErrorMessage(err.Error(), target)),
 		)
+		s.releaseClaim(monitorID, claimToken, sanitizedTarget, target)
 		return
 	}
 
@@ -333,6 +373,30 @@ func (s *Scheduler) persistObservation(
 		slog.Int64("latency_ms", out.CheckResult.LatencyMs),
 		slog.Time("next_check_at", out.Monitor.NextCheckAt),
 	)
+}
+
+func (s *Scheduler) releaseClaim(monitorID, claimToken uuid.UUID, sanitizedURL string, target *checker.Target) {
+	if monitorID == uuid.Nil || claimToken == uuid.Nil {
+		return
+	}
+	releaseCtx, cancel := context.WithTimeout(context.Background(), defaultReleaseTimeout)
+	defer cancel()
+
+	released, err := s.store.ReleaseClaim(releaseCtx, monitorID, claimToken)
+	if err != nil {
+		s.logger.Warn("failed to release monitor claim",
+			slog.String("monitor_id", monitorID.String()),
+			slog.String("url", sanitizedURL),
+			slog.String("error", checker.SanitizeErrorMessage(err.Error(), target)),
+		)
+		return
+	}
+	if !released {
+		s.logger.Debug("monitor claim already released or superseded",
+			slog.String("monitor_id", monitorID.String()),
+			slog.String("url", sanitizedURL),
+		)
+	}
 }
 
 func sanitizeURLForLog(rawURL string) string {

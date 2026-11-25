@@ -1,6 +1,7 @@
 package model_test
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -298,4 +299,37 @@ func TestMonitor_UnicodeNameValidation(t *testing.T) {
 			t.Fatalf("expected ErrNameTooLong for 256 ASCII characters, got: %v", err)
 		}
 	})
+}
+
+func TestClaimedMonitor_NeverExposesClaimTokenInJSON(t *testing.T) {
+	now := time.Now().UTC()
+	token := uuid.New()
+	mon, err := model.NewMonitor(model.CreateMonitorParams{
+		Name: "JSON Safety Monitor",
+		URL:  "https://example.com/health",
+	})
+	if err != nil {
+		t.Fatalf("NewMonitor failed: %v", err)
+	}
+
+	monJSON, err := json.Marshal(mon)
+	if err != nil {
+		t.Fatalf("json.Marshal(Monitor) failed: %v", err)
+	}
+	if strings.Contains(string(monJSON), "claim_token") || strings.Contains(string(monJSON), "claim_expires_at") {
+		t.Fatalf("Monitor JSON unexpectedly exposed claim fields: %s", monJSON)
+	}
+
+	claimed := model.ClaimedMonitor{
+		Monitor:        mon,
+		ClaimToken:     token,
+		ClaimExpiresAt: now.Add(35 * time.Second),
+	}
+	claimedJSON, err := json.Marshal(claimed)
+	if err != nil {
+		t.Fatalf("json.Marshal(ClaimedMonitor) failed: %v", err)
+	}
+	if strings.Contains(string(claimedJSON), token.String()) || strings.Contains(string(claimedJSON), "claim_token") || strings.Contains(string(claimedJSON), "ClaimToken") {
+		t.Fatalf("ClaimedMonitor JSON unexpectedly exposed claim token: %s", claimedJSON)
+	}
 }

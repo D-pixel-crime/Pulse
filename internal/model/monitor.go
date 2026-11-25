@@ -66,6 +66,15 @@ type Monitor struct {
 	UpdatedAt           time.Time  `json:"updated_at"`
 }
 
+// ClaimedMonitor pairs a due Monitor with its PostgreSQL fencing claim token
+// and lease expiration timestamp. Claim fields are internal coordination state
+// and are excluded from JSON serialization.
+type ClaimedMonitor struct {
+	Monitor        *Monitor  `json:"-"`
+	ClaimToken     uuid.UUID `json:"-"`
+	ClaimExpiresAt time.Time `json:"-"`
+}
+
 // CreateMonitorParams holds input parameters for registering a new monitor.
 type CreateMonitorParams struct {
 	Name            string `json:"name"`
