@@ -106,6 +106,7 @@ func New(cfg *config.Config, logger *slog.Logger, opts ...Option) (*App, error) 
 			monitorRepo = appInstance.store
 		}
 		appInstance.server = api.NewServer(cfg.AppAddr, logger,
+			api.WithAPIKey(cfg.APIKey),
 			api.WithReadyChecker(readyChecker),
 			api.WithMonitorRepository(monitorRepo),
 			api.WithShutdownTimeout(appInstance.shutdownTimeout),

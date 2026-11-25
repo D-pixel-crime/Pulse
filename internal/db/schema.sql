@@ -36,6 +36,10 @@ ON monitors (next_check_at);
 CREATE INDEX IF NOT EXISTS idx_monitors_due_claim
 ON monitors (next_check_at, claim_expires_at, id);
 
+-- Index for bounded cursor pagination ordered newest first
+CREATE INDEX IF NOT EXISTS idx_monitors_created_at_id
+ON monitors (created_at DESC, id DESC);
+
 -- Index for recent history lookup and stats aggregation by monitor
 CREATE INDEX IF NOT EXISTS idx_check_results_monitor_checked_at 
 ON check_results (monitor_id, checked_at DESC);

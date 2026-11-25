@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 )
 
@@ -88,7 +87,7 @@ func ReadyzHandler(checker ReadyChecker) http.HandlerFunc {
 			}
 			writeJSON(w, http.StatusServiceUnavailable, ReadyResponse{
 				Status: "unavailable",
-				Error:  "database readiness checker not configured",
+				Error:  "database unavailable",
 			})
 			return
 		}
@@ -101,7 +100,7 @@ func ReadyzHandler(checker ReadyChecker) http.HandlerFunc {
 			}
 			writeJSON(w, http.StatusServiceUnavailable, ReadyResponse{
 				Status: "unavailable",
-				Error:  fmt.Sprintf("database ping failed: %v", err),
+				Error:  "database unavailable",
 			})
 			return
 		}

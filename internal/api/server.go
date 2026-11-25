@@ -2,11 +2,15 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"path"
+	"strings"
 	"time"
 
 	"pulse/internal/config"
@@ -48,19 +52,23 @@ func (rc *responseCapture) Write(b []byte) (int, error) {
 }
 
 // Router wraps http.ServeMux to guarantee consistent JSON error formatting for 404 Not Found
-// and 405 Method Not Allowed responses across the entire API surface.
+// and 405 Method Not Allowed responses across the entire API surface, and enforces service-to-service
+// Bearer authentication for all /api/v1/ routes while keeping health probes (/healthz, /readyz) public.
 type Router struct {
-	mux    *http.ServeMux
-	logger *slog.Logger
+	mux        *http.ServeMux
+	logger     *slog.Logger
+	apiKeyHash [32]byte
+	hasAPIKey  bool
 }
 
 // NewRouter constructs a configured router with all foundation routes and fallback error handling.
 func NewRouter(logger *slog.Logger, checkers ...ReadyChecker) http.Handler {
-	return NewRouterWithRepo(logger, nil, checkers...)
+	return NewRouterWithRepo(logger, nil, "", checkers...)
 }
 
-// NewRouterWithRepo constructs a configured router including monitor CRUD routes when repo is non-nil.
-func NewRouterWithRepo(logger *slog.Logger, repo MonitorRepository, checkers ...ReadyChecker) http.Handler {
+// NewRouterWithRepo constructs a configured router including monitor CRUD routes when repo is non-nil
+// and protects all /api/v1/ routes with the provided apiKey.
+func NewRouterWithRepo(logger *slog.Logger, repo MonitorRepository, apiKey string, checkers ...ReadyChecker) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -78,14 +86,67 @@ func NewRouterWithRepo(logger *slog.Logger, repo MonitorRepository, checkers ...
 		RegisterMonitorRoutes(mux, repo, logger)
 	}
 
+	var apiKeyHash [32]byte
+	var hasAPIKey bool
+	if len(apiKey) >= config.MinAPIKeyLength {
+		apiKeyHash = sha256.Sum256([]byte(apiKey))
+		hasAPIKey = true
+	}
+
 	return &Router{
-		mux:    mux,
-		logger: logger,
+		mux:        mux,
+		logger:     logger,
+		apiKeyHash: apiKeyHash,
+		hasAPIKey:  hasAPIKey,
 	}
 }
 
+// authenticateBearer validates that the incoming request contains an Authorization: Bearer <token>
+// header matching the configured API key using subtle.ConstantTimeCompare on fixed-size SHA-256 digests.
+// Neither the key nor header is ever logged.
+func (rt *Router) authenticateBearer(r *http.Request) bool {
+	if !rt.hasAPIKey {
+		return false
+	}
+
+	var authHeaders []string
+	for k, v := range r.Header {
+		if strings.EqualFold(k, "Authorization") {
+			authHeaders = append(authHeaders, v...)
+		}
+	}
+	if len(authHeaders) != 1 {
+		return false
+	}
+
+	parts := strings.Fields(authHeaders[0])
+	if len(parts) != 2 {
+		return false
+	}
+	if !strings.EqualFold(parts[0], "Bearer") {
+		return false
+	}
+	token := parts[1]
+	if token == "" {
+		return false
+	}
+
+	suppliedHash := sha256.Sum256([]byte(token))
+	return subtle.ConstantTimeCompare(suppliedHash[:], rt.apiKeyHash[:]) == 1
+}
+
 // ServeHTTP dispatches requests to registered routes or produces standard JSON error responses.
+// It intercepts all /api/v1/ routes to enforce Bearer token authentication.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	cleanedPath := path.Clean(r.URL.Path)
+	if cleanedPath == "/api/v1" || strings.HasPrefix(cleanedPath, "/api/v1/") {
+		if !rt.authenticateBearer(r) {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+	}
+
 	h, pattern := rt.mux.Handler(r)
 	if pattern == "" {
 		capture := &responseCapture{ResponseWriter: w}
@@ -111,16 +172,25 @@ type Server struct {
 	listener        net.Listener
 	readyChecker    ReadyChecker
 	monitorRepo     MonitorRepository
+	apiKey          string
 }
 
 // Option provides functional options for configuring a Server instance.
 type Option func(*Server)
 
+// WithAPIKey configures the service-to-service Bearer token for protecting /api/v1/ routes.
+func WithAPIKey(key string) Option {
+	return func(s *Server) {
+		s.apiKey = key
+		s.httpServer.Handler = NewRouterWithRepo(s.logger, s.monitorRepo, s.apiKey, s.readyChecker)
+	}
+}
+
 // WithReadyChecker configures the database connectivity checker for the GET /readyz probe.
 func WithReadyChecker(checker ReadyChecker) Option {
 	return func(s *Server) {
 		s.readyChecker = checker
-		s.httpServer.Handler = NewRouterWithRepo(s.logger, s.monitorRepo, checker)
+		s.httpServer.Handler = NewRouterWithRepo(s.logger, s.monitorRepo, s.apiKey, checker)
 	}
 }
 
@@ -128,7 +198,7 @@ func WithReadyChecker(checker ReadyChecker) Option {
 func WithMonitorRepository(repo MonitorRepository) Option {
 	return func(s *Server) {
 		s.monitorRepo = repo
-		s.httpServer.Handler = NewRouterWithRepo(s.logger, repo, s.readyChecker)
+		s.httpServer.Handler = NewRouterWithRepo(s.logger, repo, s.apiKey, s.readyChecker)
 	}
 }
 
@@ -179,10 +249,15 @@ func WithTimeouts(readHeader, read, write, idle, shutdown time.Duration) Option 
 // New constructs a new Server instance using application configuration.
 func New(cfg *config.Config, logger *slog.Logger, opts ...Option) *Server {
 	addr := config.DefaultAppAddr
-	if cfg != nil && cfg.AppAddr != "" {
-		addr = cfg.AppAddr
+	var apiKey string
+	if cfg != nil {
+		if cfg.AppAddr != "" {
+			addr = cfg.AppAddr
+		}
+		apiKey = cfg.APIKey
 	}
-	return NewServer(addr, logger, opts...)
+	baseOpts := []Option{WithAPIKey(apiKey)}
+	return NewServer(addr, logger, append(baseOpts, opts...)...)
 }
 
 // NewServer creates a new HTTP server configured with sensible local-service timeouts.
@@ -204,10 +279,12 @@ func NewServer(addr string, logger *slog.Logger, opts ...Option) *Server {
 		},
 	}
 
-	s.httpServer.Handler = NewRouter(logger)
-
 	for _, opt := range opts {
 		opt(s)
+	}
+
+	if s.httpServer.Handler == nil {
+		s.httpServer.Handler = NewRouterWithRepo(s.logger, s.monitorRepo, s.apiKey, s.readyChecker)
 	}
 
 	return s

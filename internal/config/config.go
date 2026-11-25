@@ -30,12 +30,15 @@ const (
 	MaxMonitorInterval       = 24 * time.Hour
 	MinCheckTimeout          = 1 * time.Second
 	MaxCheckTimeout          = 30 * time.Second
+
+	MinAPIKeyLength = 32
 )
 
 // Config holds runtime configuration for the Pulse application.
 type Config struct {
 	AppAddr                string        `json:"app_addr"`
 	DatabaseURL            string        `json:"database_url"`
+	APIKey                 string        `json:"-"`
 	WorkerCount            int           `json:"worker_count"`
 	QueueCapacity          int           `json:"queue_capacity"`
 	SchedulerPollInterval  time.Duration `json:"scheduler_poll_interval"`
@@ -106,6 +109,9 @@ func LoadWithLookup(lookup func(string) (string, bool)) (*Config, error) {
 		}
 		cfg.DefaultCheckTimeout = d
 	}
+	if val, ok := lookup("PULSE_API_KEY"); ok {
+		cfg.APIKey = val
+	}
 
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("configuration validation failed: %w", err)
@@ -167,6 +173,13 @@ func (c *Config) Validate() error {
 
 	if c.DefaultCheckTimeout > c.DefaultMonitorInterval {
 		return fmt.Errorf("DEFAULT_CHECK_TIMEOUT (%s) must not exceed DEFAULT_MONITOR_INTERVAL (%s)", c.DefaultCheckTimeout, c.DefaultMonitorInterval)
+	}
+
+	if c.APIKey == "" {
+		return errors.New("PULSE_API_KEY must not be empty")
+	}
+	if len(c.APIKey) < MinAPIKeyLength {
+		return fmt.Errorf("PULSE_API_KEY must be at least %d characters, got %d", MinAPIKeyLength, len(c.APIKey))
 	}
 
 	return nil

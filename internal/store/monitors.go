@@ -175,42 +175,91 @@ func (s *Store) GetMonitorByID(ctx context.Context, id uuid.UUID) (*model.Monito
 	return s.GetByID(ctx, id)
 }
 
-// List retrieves all monitors ordered by created_at DESC.
-func (s *Store) List(ctx context.Context) ([]*model.Monitor, error) {
-	query := `
-		SELECT id, name, url, interval_seconds, timeout_seconds,
-		       current_status, consecutive_failures,
-		       last_checked_at, last_success_at, next_check_at,
-		       created_at, updated_at
-		FROM monitors
-		ORDER BY created_at DESC
-	`
+// List retrieves a bounded page of monitors ordered by created_at DESC, id DESC
+// using parameterized keyset pagination. When cursor is non-nil, only monitors created
+// before the cursor (or with a smaller UUID tie-breaker for identical created_at timestamps)
+// are returned. It queries limit + 1 items to determine if a subsequent page exists.
+// Returns the page of monitors and a next_cursor string if further rows exist.
+func (s *Store) List(ctx context.Context, limit int, cursor *model.MonitorCursor) ([]*model.Monitor, *string, error) {
+	if s == nil || s.pool == nil {
+		return nil, nil, errors.New("store pool must not be nil")
+	}
+	return s.listWithQuerier(ctx, s.pool, limit, cursor)
+}
 
-	rows, err := s.pool.Query(ctx, query)
+func (s *Store) listWithQuerier(ctx context.Context, q checkQuerier, limit int, cursor *model.MonitorCursor) ([]*model.Monitor, *string, error) {
+	if limit < 0 {
+		return nil, nil, fmt.Errorf("limit must not be negative, got %d", limit)
+	}
+	if limit == 0 {
+		limit = model.DefaultMonitorListLimit
+	} else if limit > model.MaxMonitorListLimit {
+		limit = model.MaxMonitorListLimit
+	}
+
+	fetchLimit := limit + 1
+
+	var (
+		rows pgx.Rows
+		err  error
+	)
+
+	if cursor == nil {
+		const listMonitorsSQL = `
+			SELECT id, name, url, interval_seconds, timeout_seconds,
+			       current_status, consecutive_failures,
+			       last_checked_at, last_success_at, next_check_at,
+			       created_at, updated_at
+			FROM monitors
+			ORDER BY created_at DESC, id DESC
+			LIMIT $1
+		`
+		rows, err = q.Query(ctx, listMonitorsSQL, fetchLimit)
+	} else {
+		const listMonitorsWithCursorSQL = `
+			SELECT id, name, url, interval_seconds, timeout_seconds,
+			       current_status, consecutive_failures,
+			       last_checked_at, last_success_at, next_check_at,
+			       created_at, updated_at
+			FROM monitors
+			WHERE (created_at < $1) OR (created_at = $1 AND id < $2)
+			ORDER BY created_at DESC, id DESC
+			LIMIT $3
+		`
+		rows, err = q.Query(ctx, listMonitorsWithCursorSQL, cursor.CreatedAt.UTC(), cursor.ID, fetchLimit)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to query monitors: %w", err)
+		return nil, nil, fmt.Errorf("failed to query monitors: %w", err)
 	}
 	defer rows.Close()
 
-	monitors := make([]*model.Monitor, 0)
+	monitors := make([]*model.Monitor, 0, limit)
 	for rows.Next() {
 		m, err := scanMonitor(rows)
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan monitor row: %w", err)
+			return nil, nil, fmt.Errorf("failed to scan monitor row: %w", err)
 		}
 		monitors = append(monitors, m)
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows iteration error: %w", err)
+		return nil, nil, fmt.Errorf("monitors rows iteration error: %w", err)
 	}
 
-	return monitors, nil
+	var nextCursor *string
+	if len(monitors) > limit {
+		last := monitors[limit-1]
+		c := model.EncodeCursor(last.CreatedAt, last.ID)
+		nextCursor = &c
+		monitors = monitors[:limit]
+	}
+
+	return monitors, nextCursor, nil
 }
 
 // ListMonitors is an alias for List.
-func (s *Store) ListMonitors(ctx context.Context) ([]*model.Monitor, error) {
-	return s.List(ctx)
+func (s *Store) ListMonitors(ctx context.Context, limit int, cursor *model.MonitorCursor) ([]*model.Monitor, *string, error) {
+	return s.List(ctx, limit, cursor)
 }
 
 // ListDueMonitors retrieves a bounded batch of monitors with next_check_at <= now,

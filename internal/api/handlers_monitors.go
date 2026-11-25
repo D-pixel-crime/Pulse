@@ -25,7 +25,7 @@ import (
 type MonitorRepository interface {
 	Create(ctx context.Context, m *model.Monitor) (*model.Monitor, error)
 	GetByID(ctx context.Context, id uuid.UUID) (*model.Monitor, error)
-	List(ctx context.Context) ([]*model.Monitor, error)
+	List(ctx context.Context, limit int, cursor *model.MonitorCursor) ([]*model.Monitor, *string, error)
 	Delete(ctx context.Context, id uuid.UUID) error
 	ListChecks(ctx context.Context, monitorID uuid.UUID, limit int) ([]*model.CheckResult, error)
 	GetMonitorStats(ctx context.Context, monitorID uuid.UUID, hours int) (*model.MonitorStats, error)
@@ -39,9 +39,10 @@ type CreateMonitorRequest struct {
 	TimeoutSeconds  *int   `json:"timeout_seconds"`
 }
 
-// ListMonitorsResponse represents the response containing an array of monitors.
+// ListMonitorsResponse represents the response containing an array of monitors and optional next page cursor.
 type ListMonitorsResponse struct {
-	Monitors []*model.Monitor `json:"monitors"`
+	Monitors   []*model.Monitor `json:"monitors"`
+	NextCursor *string          `json:"next_cursor"`
 }
 
 // ListChecksResponse represents the response containing recent check history for a monitor.
@@ -204,14 +205,42 @@ func CreateMonitorHandler(repo MonitorRepository, logger *slog.Logger) http.Hand
 	}
 }
 
-// ListMonitorsHandler handles GET /api/v1/monitors to list all monitors ordered by created_at DESC.
+// ListMonitorsHandler handles GET /api/v1/monitors to list monitors ordered by created_at DESC, id DESC with keyset pagination.
 func ListMonitorsHandler(repo MonitorRepository, logger *slog.Logger) http.HandlerFunc {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
-		monitors, err := repo.List(r.Context())
+		limit, err := parseBoundedIntQueryParam(
+			r,
+			"limit",
+			model.DefaultMonitorListLimit,
+			model.MinMonitorListLimit,
+			model.MaxMonitorListLimit,
+		)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		var cursor *model.MonitorCursor
+		q := r.URL.Query()
+		if q.Has("cursor") {
+			cursorVals := q["cursor"]
+			if len(cursorVals) != 1 || cursorVals[0] == "" {
+				writeError(w, http.StatusBadRequest, "invalid query parameter: cursor is malformed")
+				return
+			}
+			decoded, err := model.DecodeCursor(cursorVals[0])
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid query parameter: cursor is malformed")
+				return
+			}
+			cursor = decoded
+		}
+
+		monitors, nextCursor, err := repo.List(r.Context(), limit, cursor)
 		if err != nil {
 			logger.Error("failed to list monitors", slog.String("error", err.Error()))
 			writeError(w, http.StatusInternalServerError, "failed to list monitors")
@@ -222,7 +251,10 @@ func ListMonitorsHandler(repo MonitorRepository, logger *slog.Logger) http.Handl
 			monitors = make([]*model.Monitor, 0)
 		}
 
-		writeJSON(w, http.StatusOK, ListMonitorsResponse{Monitors: monitors})
+		writeJSON(w, http.StatusOK, ListMonitorsResponse{
+			Monitors:   monitors,
+			NextCursor: nextCursor,
+		})
 	}
 }
 

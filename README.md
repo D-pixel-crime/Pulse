@@ -2,7 +2,7 @@
 
 Pulse is a local, demo-grade API uptime monitor. Each Pulse instance runs as a single Go process backed by PostgreSQL. Multiple Pulse instances can safely share a single PostgreSQL database: PostgreSQL coordinates monitor claims across instances using row-level locking (`SELECT ... FOR UPDATE SKIP LOCKED`), expiring leases, and claim-token fencing. Each instance maintains its own bounded worker pool and in-memory queue. It periodically runs outbound HTTP/HTTPS health checks against registered endpoints, tracks monitor health state transitions, stores check history in PostgreSQL, and exposes a localhost-only REST API for managing monitors and querying availability and latency statistics.
 
-> **Local / Demo Only**: Pulse is designed strictly for local development and demonstration. The service currently has no authentication or authorization layer and is intended exclusively for localhost binding (`127.0.0.1:8080`). While the PostgreSQL-backed claim and lease architecture supports multiple instances sharing a database, outbound HTTP check execution is at-least-once rather than exactly-once, and horizontal autoscaling has not been deployed or load-tested.
+> **Local / Demo Only**: Pulse is designed strictly for local development and demonstration. All `/api/v1/` routes require service-to-service Bearer authentication via `PULSE_API_KEY` (minimum 32 characters). The service binds strictly to localhost (`127.0.0.1:8080`). While the PostgreSQL-backed claim and lease architecture supports multiple instances sharing a database, outbound HTTP check execution is at-least-once rather than exactly-once, and horizontal autoscaling has not been deployed or load-tested.
 
 ---
 
@@ -61,7 +61,7 @@ flowchart TD
 - **Claim-Token Fencing**: Workers perform outbound HTTP requests outside database transactions, then commit results within a transaction that verifies `m.claim_token = $6 AND m.claim_expires_at > db_clock.current_time`. Stale workers whose leases expired cannot overwrite newer claims.
 - **At-Least-Once Execution**: The design coordinates multiple instances safely, but outbound HTTP checks are at-least-once rather than exactly-once. If an instance crashes or stalls after executing an HTTP check but before committing the database transaction, the claim expires and another instance will retry the check.
 - **Autoscaling Status**: The architecture supports multiple instances sharing a database, but dynamic horizontal autoscaling has not been deployed or load-tested in production.
-- **Current Authentication State**: The REST API currently operates without authentication or authorization, binding strictly to localhost (`127.0.0.1:8080`). Until dedicated authentication work is implemented, the API must not be exposed to untrusted networks.
+- **Service-to-Service API Key Authentication**: All `/api/v1/` routes require `Authorization: Bearer <PULSE_API_KEY>`. The key must be at least 32 characters, is validated using constant-time comparison (`crypto/subtle.ConstantTimeCompare`), and is never logged. Health probes (`/healthz` and `/readyz`) remain public with generic error responses.
 
 ### Database Schema
 
@@ -73,7 +73,8 @@ PostgreSQL stores exactly two tables (`monitors` and `check_results`), initializ
 
 ## Features
 
-- **Monitor Management**: Create, list, inspect, and delete HTTP/HTTPS endpoint monitors (`DELETE` cascades to `check_results`).
+- **Service-to-Service API Key Authentication**: Protected `/api/v1/` routes using `Authorization: Bearer <PULSE_API_KEY>` (minimum 32 characters, constant-time comparison via `crypto/subtle`, never logged).
+- **Monitor Management & Bounded Keyset Pagination**: Create, list with deterministic cursor pagination (`(created_at, id)` newest first, default 50, max 200), inspect, and delete HTTP/HTTPS endpoint monitors (`DELETE` cascades to `check_results`).
 - **In-Process Scheduling & Bounded Concurrency**: 1-second polling ticker, in-memory `InFlightSet` deduplication, bounded work channel (default capacity `100`), and a fixed worker pool (default `5` workers).
 - **Health State Machine**: Tracks `UNKNOWN`, `UP`, and `DOWN` transitions using consecutive failure thresholds.
 - **Transactional Result Persistence**: Inserts check observations and advances `next_check_at` atomically in one PostgreSQL transaction.
@@ -85,7 +86,15 @@ PostgreSQL stores exactly two tables (`monitors` and `check_results`), initializ
 
 ## Quick Start (Docker Compose)
 
-No real secrets are required to run the local demo. `docker-compose.yml` uses development-only demo credentials (`pulse`/`pulse`), binds PostgreSQL to `127.0.0.1:5432`, runs the Go app listening on `0.0.0.0:8080` inside the container, and publishes the API exclusively on `127.0.0.1:8080` on the host.
+`docker-compose.yml` uses development-only demo credentials (`pulse`/`pulse`), binds PostgreSQL to `127.0.0.1:5432`, runs the Go app listening on `0.0.0.0:8080` inside the container, and publishes the API exclusively on `127.0.0.1:8080` on the host.
+
+Generate a local API key (minimum 32 characters) before starting:
+
+```bash
+cp .env.example .env
+# Set PULSE_API_KEY in .env:
+echo "PULSE_API_KEY=$(openssl rand -hex 32)" >> .env
+```
 
 ### Start
 
@@ -129,6 +138,8 @@ You can run only PostgreSQL in Docker Compose and run the Go application directl
 ```bash
 docker compose up -d db
 cp .env.example .env
+# Set PULSE_API_KEY in .env:
+echo "PULSE_API_KEY=$(openssl rand -hex 32)" >> .env
 set -a
 source .env
 set +a
@@ -145,6 +156,7 @@ Configuration is loaded from environment variables in [`internal/config/config.g
 
 | Variable | Default | Valid Range / Rules | Notes |
 |---|---|---|---|
+| `PULSE_API_KEY` | *(none)* | Min 32 characters | Required at startup; secret Bearer token for all `/api/v1/` routes; never logged |
 | `APP_ADDR` | `127.0.0.1:8080` | Valid `host:port` | `docker-compose.yml` sets `0.0.0.0:8080` inside container and publishes `127.0.0.1:8080:8080` |
 | `DATABASE_URL` | `postgres://pulse:pulse@localhost:5432/pulse?sslmode=disable` | `postgres://` or `postgresql://` with host | `docker-compose.yml` sets `@db:5432` for the `app` service; `pulse`/`pulse` are development-only |
 | `WORKER_COUNT` | `5` | `1` to `64` | Fixed worker pool size |
@@ -159,26 +171,30 @@ Configuration is loaded from environment variables in [`internal/config/config.g
 
 Base URL: `http://127.0.0.1:8080`
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/healthz` | Liveness probe (`200 OK`) |
-| `GET` | `/readyz` | PostgreSQL readiness probe (`200 OK` or `503 Service Unavailable`) |
-| `POST` | `/api/v1/monitors` | Create a monitor (`201 Created`) |
-| `GET` | `/api/v1/monitors` | List all monitors ordered by `created_at DESC` (`200 OK`) |
-| `GET` | `/api/v1/monitors/{id}` | Get monitor details by UUID (`200 OK` / `404 Not Found`) |
-| `GET` | `/api/v1/monitors/{id}/checks` | Get recent check results (`?limit=50`, range `1`–`200`) |
-| `GET` | `/api/v1/monitors/{id}/stats` | Get availability & latency stats (`?hours=24`, range `1`–`720`) |
-| `DELETE` | `/api/v1/monitors/{id}` | Delete a monitor and cascade delete its checks (`204 No Content`) |
+| Method | Path | Authentication | Description |
+|---|---|---|---|
+| `GET` | `/healthz` | Public | Liveness probe (`200 OK`) |
+| `GET` | `/readyz` | Public | PostgreSQL readiness probe (`200 OK` or `503 Service Unavailable`) |
+| `POST` | `/api/v1/monitors` | Bearer Token | Create a monitor (`201 Created`) |
+| `GET` | `/api/v1/monitors` | Bearer Token | List monitors with keyset pagination (`?limit=50&cursor=...`) |
+| `GET` | `/api/v1/monitors/{id}` | Bearer Token | Get monitor details by UUID (`200 OK` / `404 Not Found`) |
+| `GET` | `/api/v1/monitors/{id}/checks` | Bearer Token | Get recent check results (`?limit=50`, range `1`–`200`) |
+| `GET` | `/api/v1/monitors/{id}/stats` | Bearer Token | Get availability & latency stats (`?hours=24`, range `1`–`720`) |
+| `DELETE` | `/api/v1/monitors/{id}` | Bearer Token | Delete a monitor and cascade delete its checks (`204 No Content`) |
 
 ### Example `curl` Flow
 
 ```bash
-# 1. Liveness and readiness probes
+# Export the service API key configured in .env
+export PULSE_API_KEY="<your-32-char-api-key>"
+
+# 1. Liveness and readiness probes (public, unauthenticated)
 curl -s http://127.0.0.1:8080/healthz
 curl -s http://127.0.0.1:8080/readyz
 
 # 2. Create a monitor (immediately due on the next scheduler tick)
 curl -s -X POST http://127.0.0.1:8080/api/v1/monitors \
+  -H "Authorization: Bearer ${PULSE_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Example Site",
@@ -187,21 +203,31 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/monitors \
     "timeout_seconds": 5
   }'
 
-# 3. List monitors
-curl -s http://127.0.0.1:8080/api/v1/monitors
+# 3. List monitors (paginated with default limit=50, max=200)
+curl -s http://127.0.0.1:8080/api/v1/monitors \
+  -H "Authorization: Bearer ${PULSE_API_KEY}"
 
-# 4. Get a specific monitor by ID
+# 4. Fetch the next page using the cursor from step 3 (if next_cursor is non-null)
+NEXT_CURSOR="<next_cursor_from_previous_page>"
+curl -s "http://127.0.0.1:8080/api/v1/monitors?limit=10&cursor=${NEXT_CURSOR}" \
+  -H "Authorization: Bearer ${PULSE_API_KEY}"
+
+# 5. Get a specific monitor by ID
 MONITOR_ID="<uuid-from-create-response>"
-curl -s "http://127.0.0.1:8080/api/v1/monitors/${MONITOR_ID}"
+curl -s "http://127.0.0.1:8080/api/v1/monitors/${MONITOR_ID}" \
+  -H "Authorization: Bearer ${PULSE_API_KEY}"
 
-# 5. Inspect recent check results (default limit=50, max=200)
-curl -s "http://127.0.0.1:8080/api/v1/monitors/${MONITOR_ID}/checks?limit=10"
+# 6. Inspect recent check results (default limit=50, max=200)
+curl -s "http://127.0.0.1:8080/api/v1/monitors/${MONITOR_ID}/checks?limit=10" \
+  -H "Authorization: Bearer ${PULSE_API_KEY}"
 
-# 6. Inspect sliding-window stats (default hours=24, max=720)
-curl -s "http://127.0.0.1:8080/api/v1/monitors/${MONITOR_ID}/stats?hours=24"
+# 7. Inspect sliding-window stats (default hours=24, max=720)
+curl -s "http://127.0.0.1:8080/api/v1/monitors/${MONITOR_ID}/stats?hours=24" \
+  -H "Authorization: Bearer ${PULSE_API_KEY}"
 
-# 7. Delete the monitor (cascade deletes check_results)
-curl -i -X DELETE "http://127.0.0.1:8080/api/v1/monitors/${MONITOR_ID}"
+# 8. Delete the monitor (cascade deletes check_results)
+curl -i -X DELETE "http://127.0.0.1:8080/api/v1/monitors/${MONITOR_ID}" \
+  -H "Authorization: Bearer ${PULSE_API_KEY}"
 ```
 
 ### Monitor Creation Rules & Stats Zero-Observation Rule
@@ -292,7 +318,7 @@ DATABASE_URL=postgres://pulse:pulse@localhost:5432/pulse?sslmode=disable go test
 
 - **Multi-instance coordination via PostgreSQL**: Multiple Pulse instances can safely share PostgreSQL via row-level locks, expiring leases, and fencing tokens. However, there is no cluster management or leader election framework, and horizontal autoscaling has not been deployed or load-tested in production.
 - **At-least-once check execution**: Outbound HTTP checks are at-least-once rather than exactly-once. If an instance crashes or network delays cause lease expiration after an HTTP check has been executed but before the result is committed, another instance may claim the monitor and repeat the check. Fencing ensures stale workers cannot overwrite newer claims or check state.
-- **Current API authentication state**: The REST API currently has no authentication or authorization layer. It binds to localhost (`127.0.0.1:8080`) and is intended strictly for local development and demonstration. Until dedicated authentication work is implemented, the API must not be exposed to untrusted networks.
+- **Service-to-service API key authentication**: The REST API protects all `/api/v1/` routes with a single service-to-service `PULSE_API_KEY` bearer token (minimum 32 characters, constant-time comparison). There are no user accounts, roles, teams, or multi-tenancy. Local use must also set a local test key in `.env`. Probes (`/healthz` and `/readyz`) remain public for orchestration.
 - **In-memory queue**: The bounded work channel lives in memory only; queued tasks are not persisted as job rows and do not survive process restarts.
 - **Checks pause while an instance is stopped**: No checks execute while an instance is down, and missed intervals are never replayed or backfilled on startup.
 - **Local / demo only**: Not hardened for multi-tenant or public-internet deployment. Default credentials (`pulse`/`pulse`) are for local development only.
