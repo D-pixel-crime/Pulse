@@ -1,5 +1,6 @@
 .git
 .env
+.env*
 .env.*
 !.env.example
 AGENTS.md
@@ -10,3 +11,8 @@ pulse
 *.test
 *.out
 *.log
+coverage/
+coverage.html
+*.coverprofile
+.idea/
+.vscode/

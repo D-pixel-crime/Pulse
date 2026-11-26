@@ -46,13 +46,6 @@ func run() error {
 	}
 	defer database.Close()
 
-	// Execute idempotent initial schema setup
-	if err := database.RunSchema(ctx); err != nil {
-		logger.Error("failed to initialize database schema", slog.String("error", err.Error()))
-		return fmt.Errorf("database schema error: %w", err)
-	}
-	logger.Info("database schema initialized successfully")
-
 	// Initialize application composition root
 	application, err := app.New(cfg, logger, app.WithDB(database))
 	if err != nil {

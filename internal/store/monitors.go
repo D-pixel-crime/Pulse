@@ -142,11 +142,6 @@ func (s *Store) createWithQuerier(ctx context.Context, q checkQuerier, m *model.
 	return created, nil
 }
 
-// CreateMonitor is an alias for Create.
-func (s *Store) CreateMonitor(ctx context.Context, m *model.Monitor) (*model.Monitor, error) {
-	return s.Create(ctx, m)
-}
-
 // GetByID retrieves a single monitor by UUID using parameterized SQL.
 // Maps pgx.ErrNoRows to ErrNotFound at the store boundary.
 func (s *Store) GetByID(ctx context.Context, id uuid.UUID) (*model.Monitor, error) {
@@ -168,11 +163,6 @@ func (s *Store) GetByID(ctx context.Context, id uuid.UUID) (*model.Monitor, erro
 	}
 
 	return m, nil
-}
-
-// GetMonitorByID is an alias for GetByID.
-func (s *Store) GetMonitorByID(ctx context.Context, id uuid.UUID) (*model.Monitor, error) {
-	return s.GetByID(ctx, id)
 }
 
 // List retrieves a bounded page of monitors ordered by created_at DESC, id DESC
@@ -255,68 +245,6 @@ func (s *Store) listWithQuerier(ctx context.Context, q checkQuerier, limit int, 
 	}
 
 	return monitors, nextCursor, nil
-}
-
-// ListMonitors is an alias for List.
-func (s *Store) ListMonitors(ctx context.Context, limit int, cursor *model.MonitorCursor) ([]*model.Monitor, *string, error) {
-	return s.List(ctx, limit, cursor)
-}
-
-// ListDueMonitors retrieves a bounded batch of monitors with next_check_at <= now,
-// ordered by next_check_at ascending with id ascending as a deterministic tie-breaker.
-// When limit is 0, DefaultDueBatchLimit (100) is used; values above MaxDueBatchLimit (100)
-// are capped at MaxDueBatchLimit. It never modifies next_check_at during discovery.
-func (s *Store) ListDueMonitors(ctx context.Context, now time.Time, limit int) ([]*model.Monitor, error) {
-	if s == nil || s.pool == nil {
-		return nil, errors.New("store pool must not be nil")
-	}
-	return s.listDueMonitorsWithQuerier(ctx, s.pool, now, limit)
-}
-
-func (s *Store) listDueMonitorsWithQuerier(ctx context.Context, q checkQuerier, now time.Time, limit int) ([]*model.Monitor, error) {
-	if now.IsZero() {
-		return nil, errors.New("current time must not be zero")
-	}
-	if limit < 0 {
-		return nil, fmt.Errorf("limit must not be negative, got %d", limit)
-	}
-	if limit == 0 {
-		limit = DefaultDueBatchLimit
-	} else if limit > MaxDueBatchLimit {
-		limit = MaxDueBatchLimit
-	}
-
-	const listDueMonitorsSQL = `
-		SELECT id, name, url, interval_seconds, timeout_seconds,
-		       current_status, consecutive_failures,
-		       last_checked_at, last_success_at, next_check_at,
-		       created_at, updated_at
-		FROM monitors
-		WHERE next_check_at <= $1
-		ORDER BY next_check_at ASC, id ASC
-		LIMIT $2
-	`
-
-	rows, err := q.Query(ctx, listDueMonitorsSQL, now.UTC(), limit)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query due monitors: %w", err)
-	}
-	defer rows.Close()
-
-	monitors := make([]*model.Monitor, 0)
-	for rows.Next() {
-		m, err := scanMonitor(rows)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan due monitor row: %w", err)
-		}
-		monitors = append(monitors, m)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("due monitor rows iteration error: %w", err)
-	}
-
-	return monitors, nil
 }
 
 // ClaimDueMonitors atomically claims up to limit due, unclaimed (or lease-expired) monitors
@@ -452,9 +380,4 @@ func (s *Store) Delete(ctx context.Context, id uuid.UUID) error {
 	}
 
 	return nil
-}
-
-// DeleteMonitor is an alias for Delete.
-func (s *Store) DeleteMonitor(ctx context.Context, id uuid.UUID) error {
-	return s.Delete(ctx, id)
 }

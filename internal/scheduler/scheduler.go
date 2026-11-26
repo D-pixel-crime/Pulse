@@ -40,15 +40,12 @@ type Scheduler struct {
 	store           DueMonitorStore
 	checker         HealthChecker
 	inFlight        *InFlightSet
-	pool            *WorkerPool[model.ClaimedMonitor]
+	pool            *WorkerPool
 	workerCount     int
-	queueCapacity   int
 	pollInterval    time.Duration
 	batchLimit      int
-	defaultTimeout  time.Duration
 	shutdownTimeout time.Duration
 	retention       *RetentionLoop
-	now             func() time.Time
 	logger          *slog.Logger
 }
 
@@ -62,13 +59,6 @@ func WithWorkerCount(n int) Option {
 	}
 }
 
-// WithQueueCapacity sets the bounded work channel capacity.
-func WithQueueCapacity(n int) Option {
-	return func(s *Scheduler) {
-		s.queueCapacity = n
-	}
-}
-
 // WithPollInterval sets the scheduler ticker interval.
 func WithPollInterval(d time.Duration) Option {
 	return func(s *Scheduler) {
@@ -78,94 +68,11 @@ func WithPollInterval(d time.Duration) Option {
 	}
 }
 
-// WithBatchLimit sets the maximum number of due monitors fetched per poll tick.
-func WithBatchLimit(limit int) Option {
-	return func(s *Scheduler) {
-		if limit > 0 {
-			s.batchLimit = limit
-		}
-	}
-}
-
-// WithDefaultTimeout sets the fallback check timeout if a monitor's timeout is unset.
-func WithDefaultTimeout(d time.Duration) Option {
-	return func(s *Scheduler) {
-		if d > 0 {
-			s.defaultTimeout = d
-		}
-	}
-}
-
 // WithShutdownTimeout sets the bounded graceful-shutdown wait duration for in-progress checks.
 func WithShutdownTimeout(d time.Duration) Option {
 	return func(s *Scheduler) {
 		if d > 0 {
 			s.shutdownTimeout = d
-		}
-	}
-}
-
-// WithRetentionLoop injects an explicit RetentionLoop instance into the scheduler.
-func WithRetentionLoop(loop *RetentionLoop) Option {
-	return func(s *Scheduler) {
-		s.retention = loop
-	}
-}
-
-// WithRetentionStore configures the store used for the background retention loop.
-func WithRetentionStore(retStore RetentionStore) Option {
-	return func(s *Scheduler) {
-		if retStore != nil {
-			loop, err := NewRetentionLoop(retStore, s.logger,
-				WithLoopInterval(DefaultRetentionInterval),
-				WithLoopPeriod(DefaultRetentionPeriod),
-				WithLoopBatchSize(DefaultRetentionBatchSize),
-				WithLoopNowFunc(s.now),
-			)
-			if err == nil {
-				s.retention = loop
-			}
-		} else {
-			s.retention = nil
-		}
-	}
-}
-
-// WithRetentionInterval configures the periodic interval for the retention loop.
-func WithRetentionInterval(d time.Duration) Option {
-	return func(s *Scheduler) {
-		if s.retention != nil && d > 0 {
-			s.retention.interval = d
-		}
-	}
-}
-
-// WithRetentionPeriod configures the retention duration for the retention loop.
-func WithRetentionPeriod(d time.Duration) Option {
-	return func(s *Scheduler) {
-		if s.retention != nil && d > 0 {
-			s.retention.period = d
-		}
-	}
-}
-
-// WithRetentionBatchSize configures the batch size for the retention loop.
-func WithRetentionBatchSize(size int) Option {
-	return func(s *Scheduler) {
-		if s.retention != nil && size > 0 {
-			if size > store.MaxRetentionBatchSize {
-				size = store.MaxRetentionBatchSize
-			}
-			s.retention.batchSize = size
-		}
-	}
-}
-
-// WithNowFunc sets a custom clock function (primarily for deterministic tests).
-func WithNowFunc(now func() time.Time) Option {
-	return func(s *Scheduler) {
-		if now != nil {
-			s.now = now
 		}
 	}
 }
@@ -188,22 +95,14 @@ func New(dueStore DueMonitorStore, healthChecker HealthChecker, logger *slog.Log
 		checker:         healthChecker,
 		inFlight:        NewInFlightSet(),
 		workerCount:     config.DefaultWorkerCount,
-		queueCapacity:   config.DefaultQueueCapacity,
 		pollInterval:    config.DefaultSchedulerPollInterval,
 		batchLimit:      store.DefaultDueBatchLimit,
-		defaultTimeout:  config.DefaultCheckTimeout,
 		shutdownTimeout: defaultShutdownTimeout,
-		now:             time.Now,
 		logger:          logger,
 	}
 
 	if retStore, ok := dueStore.(RetentionStore); ok && retStore != nil {
-		retLoop, err := NewRetentionLoop(retStore, logger,
-			WithLoopInterval(DefaultRetentionInterval),
-			WithLoopPeriod(DefaultRetentionPeriod),
-			WithLoopBatchSize(DefaultRetentionBatchSize),
-			WithLoopNowFunc(s.now),
-		)
+		retLoop, err := NewRetentionLoop(retStore, logger)
 		if err == nil {
 			s.retention = retLoop
 		}
@@ -217,23 +116,13 @@ func New(dueStore DueMonitorStore, healthChecker HealthChecker, logger *slog.Log
 		s.batchLimit = store.MaxDueBatchLimit
 	}
 
-	pool, err := NewWorkerPool[model.ClaimedMonitor](s.workerCount, s.queueCapacity, s.handleMonitor)
+	pool, err := NewWorkerPool(s.workerCount, s.handleMonitor)
 	if err != nil {
 		return nil, fmt.Errorf("invalid scheduler worker pool configuration: %w", err)
 	}
 	s.pool = pool
 
 	return s, nil
-}
-
-// InFlight returns the scheduler's in-flight monitor tracking set.
-func (s *Scheduler) InFlight() *InFlightSet {
-	return s.inFlight
-}
-
-// RetentionLoop returns the scheduler's background retention loop, or nil if unconfigured.
-func (s *Scheduler) RetentionLoop() *RetentionLoop {
-	return s.retention
 }
 
 // Run starts the worker pool, retention loop (if configured), and runs the single scheduler ticker loop until ctx is canceled.
@@ -320,8 +209,8 @@ func (s *Scheduler) PollOnce(ctx context.Context) {
 	if s.batchLimit > 0 && s.batchLimit < claimLimit {
 		claimLimit = s.batchLimit
 	}
-	if s.queueCapacity > 0 && s.queueCapacity < claimLimit {
-		claimLimit = s.queueCapacity
+	if queueCap := s.pool.QueueCap(); queueCap > 0 && queueCap < claimLimit {
+		claimLimit = queueCap
 	}
 
 	claimed, err := s.store.ClaimDueMonitors(ctx, claimLimit)
@@ -376,7 +265,7 @@ func (s *Scheduler) handleMonitor(ctx context.Context, cm model.ClaimedMonitor) 
 
 	target, err := checker.ValidateTarget(m.URL)
 	if err != nil {
-		now := s.now().UTC()
+		now := time.Now().UTC()
 		errMsg := checker.SanitizeErrorMessage(err.Error(), nil)
 		s.persistObservation(ctx, m.ID, cm.ClaimToken, nil, m.URL, checker.CheckObservation{
 			CheckedAt:    now,
@@ -390,7 +279,7 @@ func (s *Scheduler) handleMonitor(ctx context.Context, cm model.ClaimedMonitor) 
 
 	timeout := time.Duration(m.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
-		timeout = s.defaultTimeout
+		timeout = time.Duration(model.DefaultTimeoutSeconds) * time.Second
 	}
 
 	obs := s.checker.Check(ctx, target, timeout)

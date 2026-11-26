@@ -10,9 +10,7 @@ import (
 )
 
 const (
-	// DefaultRetentionDays defines the fixed retention period in days (3x max stats window of 30 days).
-	DefaultRetentionDays = 90
-	// DefaultRetentionPeriod defines the fixed 90-day retention duration.
+	// DefaultRetentionPeriod defines the fixed 90-day retention duration (3x max stats window of 30 days).
 	DefaultRetentionPeriod = 90 * 24 * time.Hour
 	// DefaultRetentionBatchSize defines the maximum rows deleted per retention batch query.
 	DefaultRetentionBatchSize = 1000
@@ -68,39 +66,4 @@ func (s *Store) deleteExpiredCheckResultsWithExecer(ctx context.Context, ex rete
 	}
 
 	return tag.RowsAffected(), nil
-}
-
-// PurgeExpiredCheckResults deletes expired check_results older than the cutoff timestamp
-// in bounded batches until fewer than batchSize rows are returned.
-// It stops immediately if ctx is canceled and does not perform one unbounded DELETE.
-func (s *Store) PurgeExpiredCheckResults(ctx context.Context, cutoff time.Time, batchSize int) (int64, error) {
-	if s == nil || s.pool == nil {
-		return 0, errors.New("store pool must not be nil")
-	}
-	if batchSize <= 0 {
-		batchSize = DefaultRetentionBatchSize
-	}
-	if batchSize > MaxRetentionBatchSize {
-		batchSize = MaxRetentionBatchSize
-	}
-	if cutoff.IsZero() {
-		cutoff = time.Now().Add(-DefaultRetentionPeriod)
-	}
-	cutoff = cutoff.UTC()
-
-	var totalDeleted int64
-	for {
-		if err := ctx.Err(); err != nil {
-			return totalDeleted, err
-		}
-		deleted, err := s.DeleteExpiredCheckResults(ctx, cutoff, batchSize)
-		if err != nil {
-			return totalDeleted, err
-		}
-		totalDeleted += deleted
-		if deleted < int64(batchSize) {
-			break
-		}
-	}
-	return totalDeleted, nil
 }

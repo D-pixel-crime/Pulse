@@ -18,7 +18,6 @@ const MaxErrorMessageLength = 1024
 // CheckObservation captures the raw observation of an executed HTTP health check.
 type CheckObservation struct {
 	CheckedAt    time.Time     `json:"checked_at"`
-	CompletedAt  time.Time     `json:"completed_at"`
 	Success      bool          `json:"success"`
 	HTTPStatus   *int          `json:"http_status"`
 	Latency      time.Duration `json:"latency"`
@@ -41,63 +40,22 @@ type Checker struct {
 	client *http.Client
 }
 
-// checkerOption configures optional Checker behavior for tests.
-type checkerOption func(*checkerConfig)
-
-type checkerConfig struct {
-	tlsConfig *tls.Config
-	transport http.RoundTripper
-}
-
-// withTLSConfig sets a custom TLS configuration on the checker's transport (test-only).
-func withTLSConfig(cfg *tls.Config) checkerOption {
-	return func(c *checkerConfig) {
-		c.tlsConfig = cfg
-	}
-}
-
-// withTransport sets a custom http.RoundTripper on the checker's HTTP client (test-only).
-func withTransport(rt http.RoundTripper) checkerOption {
-	return func(c *checkerConfig) {
-		c.transport = rt
-	}
-}
-
 // NewChecker initializes an HTTP health checker configured with bounded timeouts,
 // safe dialer integration, disabled environment proxies, and disabled redirect following.
-func NewChecker(dialer *SafeDialer, opts ...checkerOption) *Checker {
-	cfg := &checkerConfig{}
-	for _, opt := range opts {
-		opt(cfg)
+func NewChecker(dialer *SafeDialer) *Checker {
+	if dialer == nil {
+		dialer = NewSafeDialer()
 	}
 
-	var clientTransport http.RoundTripper
-	if cfg.transport != nil {
-		clientTransport = cfg.transport
-	} else {
-		if dialer == nil {
-			dialer = NewSafeDialer()
-		}
-
-		var tlsClientConfig *tls.Config
-		if cfg.tlsConfig != nil {
-			tlsClientConfig = cfg.tlsConfig.Clone()
-		} else {
-			tlsClientConfig = &tls.Config{
-				MinVersion: tls.VersionTLS12,
-			}
-		}
-
-		clientTransport = &http.Transport{
-			DialContext:           dialer.DialContext,
-			Proxy:                 nil, // Explicitly disable environment proxy use (HTTP_PROXY, HTTPS_PROXY)
-			TLSClientConfig:       tlsClientConfig,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 10 * time.Second,
-			DisableKeepAlives:     false,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-		}
+	clientTransport := &http.Transport{
+		DialContext:           dialer.DialContext,
+		Proxy:                 nil, // Explicitly disable environment proxy use (HTTP_PROXY, HTTPS_PROXY)
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		DisableKeepAlives:     false,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
 	}
 
 	client := &http.Client{
@@ -158,7 +116,6 @@ func (c *Checker) Check(ctx context.Context, target *Target, timeout time.Durati
 		errMsg := "check target must not be nil"
 		return CheckObservation{
 			CheckedAt:    now,
-			CompletedAt:  now,
 			Success:      false,
 			HTTPStatus:   nil,
 			Latency:      0,
@@ -175,11 +132,9 @@ func (c *Checker) Check(ctx context.Context, target *Target, timeout time.Durati
 	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, target.RawURL(), nil)
 	if err != nil {
 		latency := time.Since(start)
-		completedAt := checkedAt.Add(latency)
 		errMsg := SanitizeErrorMessage(err.Error(), target)
 		return CheckObservation{
 			CheckedAt:    checkedAt,
-			CompletedAt:  completedAt,
 			Success:      false,
 			HTTPStatus:   nil,
 			Latency:      latency,
@@ -193,7 +148,6 @@ func (c *Checker) Check(ctx context.Context, target *Target, timeout time.Durati
 
 	resp, err := c.client.Do(req)
 	latency := time.Since(start)
-	completedAt := checkedAt.Add(latency)
 
 	if err != nil {
 		if resp != nil && resp.Body != nil {
@@ -202,7 +156,6 @@ func (c *Checker) Check(ctx context.Context, target *Target, timeout time.Durati
 		errMsg := SanitizeErrorMessage(err.Error(), target)
 		return CheckObservation{
 			CheckedAt:    checkedAt,
-			CompletedAt:  completedAt,
 			Success:      false,
 			HTTPStatus:   nil,
 			Latency:      latency,
@@ -222,7 +175,6 @@ func (c *Checker) Check(ctx context.Context, target *Target, timeout time.Durati
 	if statusCode >= 200 && statusCode <= 399 {
 		return CheckObservation{
 			CheckedAt:    checkedAt,
-			CompletedAt:  completedAt,
 			Success:      true,
 			HTTPStatus:   &statusCode,
 			Latency:      latency,
@@ -242,7 +194,6 @@ func (c *Checker) Check(ctx context.Context, target *Target, timeout time.Durati
 
 	return CheckObservation{
 		CheckedAt:    checkedAt,
-		CompletedAt:  completedAt,
 		Success:      false,
 		HTTPStatus:   &statusCode,
 		Latency:      latency,

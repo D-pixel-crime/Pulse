@@ -1,5 +1,5 @@
 -- PostgreSQL Initial Schema for Pulse
--- Idempotent execution: safe to run repeatedly on startup
+-- Idempotent execution: safe to apply during database initialization
 
 CREATE TABLE IF NOT EXISTS monitors (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -27,10 +27,6 @@ CREATE TABLE IF NOT EXISTS check_results (
     latency_ms BIGINT NOT NULL,
     error_message VARCHAR(1024) NULL
 );
-
--- Index for due-monitor poller lookup
-CREATE INDEX IF NOT EXISTS idx_monitors_next_check_at 
-ON monitors (next_check_at);
 
 -- Index for claimable due-monitor lookup and deterministic ordering
 CREATE INDEX IF NOT EXISTS idx_monitors_due_claim

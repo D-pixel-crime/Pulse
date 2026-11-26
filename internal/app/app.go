@@ -54,13 +54,6 @@ func WithStore(s *store.Store) Option {
 	}
 }
 
-// WithChecker allows injecting a custom HTTP health checker instance.
-func WithChecker(c *checker.Checker) Option {
-	return func(a *App) {
-		a.checker = c
-	}
-}
-
 // WithScheduler allows injecting a custom or test scheduler instance.
 func WithScheduler(s *scheduler.Scheduler) Option {
 	return func(a *App) {
@@ -123,9 +116,7 @@ func New(cfg *config.Config, logger *slog.Logger, opts ...Option) (*App, error) 
 			appInstance.checker,
 			logger,
 			scheduler.WithWorkerCount(cfg.WorkerCount),
-			scheduler.WithQueueCapacity(cfg.QueueCapacity),
 			scheduler.WithPollInterval(cfg.SchedulerPollInterval),
-			scheduler.WithDefaultTimeout(cfg.DefaultCheckTimeout),
 			scheduler.WithShutdownTimeout(appInstance.shutdownTimeout),
 		)
 		if err != nil {
@@ -135,49 +126,6 @@ func New(cfg *config.Config, logger *slog.Logger, opts ...Option) (*App, error) 
 	}
 
 	return appInstance, nil
-}
-
-// Config returns the application configuration.
-func (a *App) Config() *config.Config {
-	return a.cfg
-}
-
-// Logger returns the application logger.
-func (a *App) Logger() *slog.Logger {
-	return a.logger
-}
-
-// Server returns the configured API server.
-func (a *App) Server() *api.Server {
-	return a.server
-}
-
-// DB returns the configured database connection wrapper.
-func (a *App) DB() *db.DB {
-	return a.db
-}
-
-// Store returns the configured monitor store.
-func (a *App) Store() *store.Store {
-	return a.store
-}
-
-// Checker returns the configured outbound HTTP checker.
-func (a *App) Checker() *checker.Checker {
-	return a.checker
-}
-
-// Scheduler returns the configured in-process scheduler, or nil if no store was configured.
-func (a *App) Scheduler() *scheduler.Scheduler {
-	return a.scheduler
-}
-
-// RetentionLoop returns the configured retention loop from the scheduler, or nil if unconfigured.
-func (a *App) RetentionLoop() *scheduler.RetentionLoop {
-	if a.scheduler != nil {
-		return a.scheduler.RetentionLoop()
-	}
-	return nil
 }
 
 // Run executes the application lifecycle, coordinating the HTTP server and background

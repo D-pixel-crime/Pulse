@@ -22,14 +22,6 @@ type ReadyChecker interface {
 	Ping(ctx context.Context) error
 }
 
-// ReadyCheckFunc adapts a function to satisfy the ReadyChecker interface.
-type ReadyCheckFunc func(ctx context.Context) error
-
-// Ping calls the underlying function to verify readiness.
-func (f ReadyCheckFunc) Ping(ctx context.Context) error {
-	return f(ctx)
-}
-
 // ErrorResponse represents standard JSON error payloads across the API.
 type ErrorResponse struct {
 	Error string `json:"error"`

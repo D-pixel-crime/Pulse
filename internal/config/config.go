@@ -8,29 +8,21 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
 const (
 	DefaultAppAddr               = "127.0.0.1:8080"
-	DefaultDatabaseURL           = "postgres://pulse:pulse@localhost:5432/pulse?sslmode=disable"
+	DefaultDatabaseURL           = ""
 	DefaultWorkerCount           = 5
-	DefaultQueueCapacity         = 100
 	DefaultSchedulerPollInterval = 1 * time.Second
-	DefaultMonitorInterval       = 60 * time.Second
-	DefaultCheckTimeout          = 5 * time.Second
 	DefaultDBMaxConns            = 5
 
 	MinWorkerCount           = 1
 	MaxWorkerCount           = 64
-	MinQueueCapacity         = 1
-	MaxQueueCapacity         = 10000
 	MinSchedulerPollInterval = 100 * time.Millisecond
 	MaxSchedulerPollInterval = 1 * time.Hour
-	MinMonitorInterval       = 30 * time.Second
-	MaxMonitorInterval       = 24 * time.Hour
-	MinCheckTimeout          = 1 * time.Second
-	MaxCheckTimeout          = 30 * time.Second
 	MinDBMaxConns            = 1
 	MaxDBMaxConns            = 20
 
@@ -39,28 +31,22 @@ const (
 
 // Config holds runtime configuration for the Pulse application.
 type Config struct {
-	AppAddr                string        `json:"app_addr"`
-	DatabaseURL            string        `json:"database_url"`
-	APIKey                 string        `json:"-"`
-	WorkerCount            int           `json:"worker_count"`
-	QueueCapacity          int           `json:"queue_capacity"`
-	SchedulerPollInterval  time.Duration `json:"scheduler_poll_interval"`
-	DefaultMonitorInterval time.Duration `json:"default_monitor_interval"`
-	DefaultCheckTimeout    time.Duration `json:"default_check_timeout"`
-	DBMaxConns             int           `json:"db_max_conns"`
+	AppAddr               string        `json:"app_addr"`
+	DatabaseURL           string        `json:"database_url"`
+	APIKey                string        `json:"-"`
+	WorkerCount           int           `json:"worker_count"`
+	SchedulerPollInterval time.Duration `json:"scheduler_poll_interval"`
+	DBMaxConns            int           `json:"db_max_conns"`
 }
 
 // NewDefault returns a Config initialized with standard specification defaults.
 func NewDefault() *Config {
 	return &Config{
-		AppAddr:                DefaultAppAddr,
-		DatabaseURL:            DefaultDatabaseURL,
-		WorkerCount:            DefaultWorkerCount,
-		QueueCapacity:          DefaultQueueCapacity,
-		SchedulerPollInterval:  DefaultSchedulerPollInterval,
-		DefaultMonitorInterval: DefaultMonitorInterval,
-		DefaultCheckTimeout:    DefaultCheckTimeout,
-		DBMaxConns:             DefaultDBMaxConns,
+		AppAddr:               DefaultAppAddr,
+		DatabaseURL:           DefaultDatabaseURL,
+		WorkerCount:           DefaultWorkerCount,
+		SchedulerPollInterval: DefaultSchedulerPollInterval,
+		DBMaxConns:            DefaultDBMaxConns,
 	}
 }
 
@@ -74,55 +60,34 @@ func LoadWithLookup(lookup func(string) (string, bool)) (*Config, error) {
 	cfg := NewDefault()
 
 	if val, ok := lookup("APP_ADDR"); ok {
-		cfg.AppAddr = val
+		cfg.AppAddr = strings.TrimSpace(val)
 	}
 	if val, ok := lookup("DATABASE_URL"); ok {
-		cfg.DatabaseURL = val
+		cfg.DatabaseURL = strings.TrimSpace(val)
 	}
 	if val, ok := lookup("WORKER_COUNT"); ok {
-		n, err := strconv.Atoi(val)
+		n, err := strconv.Atoi(strings.TrimSpace(val))
 		if err != nil {
 			return nil, fmt.Errorf("invalid WORKER_COUNT: %w", err)
 		}
 		cfg.WorkerCount = n
 	}
-	if val, ok := lookup("QUEUE_CAPACITY"); ok {
-		n, err := strconv.Atoi(val)
-		if err != nil {
-			return nil, fmt.Errorf("invalid QUEUE_CAPACITY: %w", err)
-		}
-		cfg.QueueCapacity = n
-	}
 	if val, ok := lookup("SCHEDULER_POLL_INTERVAL"); ok {
-		d, err := time.ParseDuration(val)
+		d, err := time.ParseDuration(strings.TrimSpace(val))
 		if err != nil {
 			return nil, fmt.Errorf("invalid SCHEDULER_POLL_INTERVAL: %w", err)
 		}
 		cfg.SchedulerPollInterval = d
 	}
-	if val, ok := lookup("DEFAULT_MONITOR_INTERVAL"); ok {
-		d, err := time.ParseDuration(val)
-		if err != nil {
-			return nil, fmt.Errorf("invalid DEFAULT_MONITOR_INTERVAL: %w", err)
-		}
-		cfg.DefaultMonitorInterval = d
-	}
-	if val, ok := lookup("DEFAULT_CHECK_TIMEOUT"); ok {
-		d, err := time.ParseDuration(val)
-		if err != nil {
-			return nil, fmt.Errorf("invalid DEFAULT_CHECK_TIMEOUT: %w", err)
-		}
-		cfg.DefaultCheckTimeout = d
-	}
 	if val, ok := lookup("DB_MAX_CONNS"); ok {
-		n, err := strconv.Atoi(val)
+		n, err := strconv.Atoi(strings.TrimSpace(val))
 		if err != nil {
 			return nil, fmt.Errorf("invalid DB_MAX_CONNS: %w", err)
 		}
 		cfg.DBMaxConns = n
 	}
 	if val, ok := lookup("PULSE_API_KEY"); ok {
-		cfg.APIKey = val
+		cfg.APIKey = strings.TrimSpace(val)
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -167,24 +132,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("WORKER_COUNT must be between %d and %d, got %d", MinWorkerCount, MaxWorkerCount, c.WorkerCount)
 	}
 
-	if c.QueueCapacity < MinQueueCapacity || c.QueueCapacity > MaxQueueCapacity {
-		return fmt.Errorf("QUEUE_CAPACITY must be between %d and %d, got %d", MinQueueCapacity, MaxQueueCapacity, c.QueueCapacity)
-	}
-
 	if c.SchedulerPollInterval < MinSchedulerPollInterval || c.SchedulerPollInterval > MaxSchedulerPollInterval {
 		return fmt.Errorf("SCHEDULER_POLL_INTERVAL must be between %s and %s, got %s", MinSchedulerPollInterval, MaxSchedulerPollInterval, c.SchedulerPollInterval)
-	}
-
-	if c.DefaultMonitorInterval < MinMonitorInterval || c.DefaultMonitorInterval > MaxMonitorInterval {
-		return fmt.Errorf("DEFAULT_MONITOR_INTERVAL must be between %s and %s, got %s", MinMonitorInterval, MaxMonitorInterval, c.DefaultMonitorInterval)
-	}
-
-	if c.DefaultCheckTimeout < MinCheckTimeout || c.DefaultCheckTimeout > MaxCheckTimeout {
-		return fmt.Errorf("DEFAULT_CHECK_TIMEOUT must be between %s and %s, got %s", MinCheckTimeout, MaxCheckTimeout, c.DefaultCheckTimeout)
-	}
-
-	if c.DefaultCheckTimeout > c.DefaultMonitorInterval {
-		return fmt.Errorf("DEFAULT_CHECK_TIMEOUT (%s) must not exceed DEFAULT_MONITOR_INTERVAL (%s)", c.DefaultCheckTimeout, c.DefaultMonitorInterval)
 	}
 
 	if c.DBMaxConns < MinDBMaxConns || c.DBMaxConns > MaxDBMaxConns {
@@ -222,10 +171,7 @@ func (c *Config) LogValue() slog.Value {
 		slog.String("app_addr", c.AppAddr),
 		slog.String("database_url", c.RedactedDatabaseURL()),
 		slog.Int("worker_count", c.WorkerCount),
-		slog.Int("queue_capacity", c.QueueCapacity),
 		slog.Duration("scheduler_poll_interval", c.SchedulerPollInterval),
-		slog.Duration("default_monitor_interval", c.DefaultMonitorInterval),
-		slog.Duration("default_check_timeout", c.DefaultCheckTimeout),
 		slog.Int("db_max_conns", c.DBMaxConns),
 	)
 }

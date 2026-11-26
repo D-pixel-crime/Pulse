@@ -32,9 +32,6 @@ var (
 type Target struct {
 	rawURL     string
 	parsedURL  *url.URL
-	scheme     string
-	host       string // Hostname or IP literal without brackets
-	port       string // Port number string (e.g. "80", "443", "8080")
 	hostHeader string // Preserved Host header (e.g. "example.com" or "example.com:8080")
 }
 
@@ -43,29 +40,9 @@ func (t *Target) RawURL() string {
 	return t.rawURL
 }
 
-// String implements fmt.Stringer, returning the raw URL.
-func (t *Target) String() string {
-	return t.rawURL
-}
-
 // URL returns the parsed *url.URL structure.
 func (t *Target) URL() *url.URL {
 	return t.parsedURL
-}
-
-// Scheme returns the normalized lower-case URL scheme ("http" or "https").
-func (t *Target) Scheme() string {
-	return t.scheme
-}
-
-// Host returns the target host (hostname or IP literal without brackets).
-func (t *Target) Host() string {
-	return t.host
-}
-
-// Port returns the target port number as a string.
-func (t *Target) Port() string {
-	return t.port
 }
 
 // HostHeader returns the preserved host header to send in outbound requests.
@@ -343,16 +320,8 @@ func ValidateTarget(rawURL string) (*Target, error) {
 	return &Target{
 		rawURL:     trimmed,
 		parsedURL:  parsed,
-		scheme:     scheme,
-		host:       host,
-		port:       port,
 		hostHeader: hostHeader,
 	}, nil
-}
-
-// ValidateURL is an alias for ValidateTarget.
-func ValidateURL(rawURL string) (*Target, error) {
-	return ValidateTarget(rawURL)
 }
 
 // Resolver defines the DNS resolution interface required by SafeDialer.

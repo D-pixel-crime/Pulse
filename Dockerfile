@@ -8,7 +8,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy application source and embedded SQL schema
+# Copy application source
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
 

@@ -2,15 +2,11 @@ package db
 
 import (
 	"context"
-	_ "embed"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-//go:embed schema.sql
-var SchemaSQL string
 
 const (
 	// DefaultMinConns defines the minimum idle connections kept open in the pool.
@@ -26,8 +22,7 @@ const (
 	DefaultHealthCheckPeriod = 1 * time.Minute
 )
 
-// DB wraps a pgxpool.Pool to provide lifecycle management, connectivity checks,
-// and schema execution.
+// DB wraps a pgxpool.Pool to provide lifecycle management and connectivity checks.
 type DB struct {
 	pool *pgxpool.Pool
 }
@@ -40,24 +35,6 @@ func WithMaxConns(maxConns int32) Option {
 	return func(cfg *pgxpool.Config) {
 		if maxConns > 0 {
 			cfg.MaxConns = maxConns
-		}
-	}
-}
-
-// WithPoolLimits configures explicit connection pool boundaries.
-func WithPoolLimits(minConns, maxConns int32, maxLifetime, maxIdle time.Duration) Option {
-	return func(cfg *pgxpool.Config) {
-		if minConns >= 0 {
-			cfg.MinConns = minConns
-		}
-		if maxConns > 0 {
-			cfg.MaxConns = maxConns
-		}
-		if maxLifetime > 0 {
-			cfg.MaxConnLifetime = maxLifetime
-		}
-		if maxIdle > 0 {
-			cfg.MaxConnIdleTime = maxIdle
 		}
 	}
 }
@@ -107,11 +84,6 @@ func Connect(ctx context.Context, databaseURL string, opts ...Option) (*DB, erro
 	return &DB{pool: pool}, nil
 }
 
-// Wrap creates a DB wrapper from an existing pgxpool.Pool.
-func Wrap(pool *pgxpool.Pool) *DB {
-	return &DB{pool: pool}
-}
-
 // Pool returns the underlying *pgxpool.Pool.
 func (d *DB) Pool() *pgxpool.Pool {
 	if d == nil {
@@ -133,25 +105,4 @@ func (d *DB) Close() {
 	if d != nil && d.pool != nil {
 		d.pool.Close()
 	}
-}
-
-// RunSchema executes the embedded idempotent schema.sql script against the pool.
-// It creates exactly two tables (monitors, check_results) and supporting indexes.
-// It never drops or resets existing tables.
-func (d *DB) RunSchema(ctx context.Context) error {
-	if d == nil || d.pool == nil {
-		return fmt.Errorf("database connection pool is nil")
-	}
-	return RunSchema(ctx, d.pool)
-}
-
-// RunSchema executes the embedded idempotent schema.sql script directly on a pgxpool.Pool.
-func RunSchema(ctx context.Context, pool *pgxpool.Pool) error {
-	if pool == nil {
-		return fmt.Errorf("pgxpool is nil")
-	}
-	if _, err := pool.Exec(ctx, SchemaSQL); err != nil {
-		return fmt.Errorf("failed to execute schema: %w", err)
-	}
-	return nil
 }

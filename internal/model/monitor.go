@@ -199,25 +199,3 @@ func (m *Monitor) Validate() error {
 
 	return nil
 }
-
-// InitializeCreationDefaults sets the mandatory initial state attributes for a newly created monitor.
-// Invariant: current_status is UNKNOWN, consecutive_failures is 0, last_checked_at and last_success_at
-// are nil, and next_check_at equals created_at (due immediately).
-func (m *Monitor) InitializeCreationDefaults(now time.Time) {
-	if m.ID == uuid.Nil {
-		m.ID = uuid.New()
-	}
-	if m.IntervalSeconds == 0 {
-		m.IntervalSeconds = DefaultIntervalSeconds
-	}
-	if m.TimeoutSeconds == 0 {
-		m.TimeoutSeconds = DefaultTimeoutSeconds
-	}
-	m.CurrentStatus = StatusUnknown
-	m.ConsecutiveFailures = 0
-	m.LastCheckedAt = nil
-	m.LastSuccessAt = nil
-	m.CreatedAt = now.UTC()
-	m.UpdatedAt = now.UTC()
-	m.NextCheckAt = now.UTC()
-}

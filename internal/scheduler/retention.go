@@ -29,63 +29,12 @@ type RetentionLoop struct {
 	interval  time.Duration
 	period    time.Duration
 	batchSize int
-	now       func() time.Time
 	logger    *slog.Logger
 }
 
-// RetentionOption configures optional RetentionLoop properties.
-type RetentionOption func(*RetentionLoop)
-
-// WithLoopInterval sets the periodic execution interval (default 24h).
-func WithLoopInterval(d time.Duration) RetentionOption {
-	return func(r *RetentionLoop) {
-		if d > 0 {
-			r.interval = d
-		}
-	}
-}
-
-// WithLoopPeriod sets the expiration cutoff age (default 90 days).
-func WithLoopPeriod(d time.Duration) RetentionOption {
-	return func(r *RetentionLoop) {
-		if d > 0 {
-			r.period = d
-		}
-	}
-}
-
-// WithLoopBatchSize sets the batch limit for each DELETE pass (default 1000).
-func WithLoopBatchSize(size int) RetentionOption {
-	return func(r *RetentionLoop) {
-		if size > 0 {
-			if size > store.MaxRetentionBatchSize {
-				size = store.MaxRetentionBatchSize
-			}
-			r.batchSize = size
-		}
-	}
-}
-
-// WithLoopNowFunc sets a custom clock function for deterministic tests.
-func WithLoopNowFunc(now func() time.Time) RetentionOption {
-	return func(r *RetentionLoop) {
-		if now != nil {
-			r.now = now
-		}
-	}
-}
-
-// WithLoopLogger sets a custom logger for the retention loop.
-func WithLoopLogger(logger *slog.Logger) RetentionOption {
-	return func(r *RetentionLoop) {
-		if logger != nil {
-			r.logger = logger
-		}
-	}
-}
-
-// NewRetentionLoop creates a RetentionLoop configured to purge check history older than 90 days.
-func NewRetentionLoop(retStore RetentionStore, logger *slog.Logger, opts ...RetentionOption) (*RetentionLoop, error) {
+// NewRetentionLoop creates a RetentionLoop with fixed 90-day retention, 24-hour interval,
+// and 1,000-row batch size defaults.
+func NewRetentionLoop(retStore RetentionStore, logger *slog.Logger) (*RetentionLoop, error) {
 	if retStore == nil {
 		return nil, errors.New("retention store must not be nil")
 	}
@@ -93,35 +42,13 @@ func NewRetentionLoop(retStore RetentionStore, logger *slog.Logger, opts ...Rete
 		logger = slog.Default()
 	}
 
-	r := &RetentionLoop{
+	return &RetentionLoop{
 		store:     retStore,
 		interval:  DefaultRetentionInterval,
 		period:    DefaultRetentionPeriod,
 		batchSize: DefaultRetentionBatchSize,
-		now:       time.Now,
 		logger:    logger,
-	}
-
-	for _, opt := range opts {
-		opt(r)
-	}
-
-	return r, nil
-}
-
-// Interval returns the configured retention pass interval.
-func (r *RetentionLoop) Interval() time.Duration {
-	return r.interval
-}
-
-// Period returns the configured retention cutoff period.
-func (r *RetentionLoop) Period() time.Duration {
-	return r.period
-}
-
-// BatchSize returns the configured retention batch size.
-func (r *RetentionLoop) BatchSize() int {
-	return r.batchSize
+	}, nil
 }
 
 // Run executes the retention cleanup once immediately at startup, then periodically on
@@ -165,7 +92,7 @@ func (r *RetentionLoop) RunPass(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 
-	cutoff := r.now().UTC().Add(-r.period)
+	cutoff := time.Now().UTC().Add(-r.period)
 	var totalDeleted int64
 
 	for {

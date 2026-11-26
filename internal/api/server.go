@@ -61,11 +61,6 @@ type Router struct {
 	hasAPIKey  bool
 }
 
-// NewRouter constructs a configured router with all foundation routes and fallback error handling.
-func NewRouter(logger *slog.Logger, checkers ...ReadyChecker) http.Handler {
-	return NewRouterWithRepo(logger, nil, "", checkers...)
-}
-
 // NewRouterWithRepo constructs a configured router including monitor CRUD routes when repo is non-nil
 // and protects all /api/v1/ routes with the provided apiKey.
 func NewRouterWithRepo(logger *slog.Logger, repo MonitorRepository, apiKey string, checkers ...ReadyChecker) http.Handler {
@@ -225,41 +220,6 @@ func WithHandler(h http.Handler) Option {
 	}
 }
 
-// WithTimeouts customizes HTTP server timeouts.
-func WithTimeouts(readHeader, read, write, idle, shutdown time.Duration) Option {
-	return func(s *Server) {
-		if readHeader > 0 {
-			s.httpServer.ReadHeaderTimeout = readHeader
-		}
-		if read > 0 {
-			s.httpServer.ReadTimeout = read
-		}
-		if write > 0 {
-			s.httpServer.WriteTimeout = write
-		}
-		if idle > 0 {
-			s.httpServer.IdleTimeout = idle
-		}
-		if shutdown > 0 {
-			s.shutdownTimeout = shutdown
-		}
-	}
-}
-
-// New constructs a new Server instance using application configuration.
-func New(cfg *config.Config, logger *slog.Logger, opts ...Option) *Server {
-	addr := config.DefaultAppAddr
-	var apiKey string
-	if cfg != nil {
-		if cfg.AppAddr != "" {
-			addr = cfg.AppAddr
-		}
-		apiKey = cfg.APIKey
-	}
-	baseOpts := []Option{WithAPIKey(apiKey)}
-	return NewServer(addr, logger, append(baseOpts, opts...)...)
-}
-
 // NewServer creates a new HTTP server configured with sensible local-service timeouts.
 func NewServer(addr string, logger *slog.Logger, opts ...Option) *Server {
 	if logger == nil {
@@ -288,29 +248,6 @@ func NewServer(addr string, logger *slog.Logger, opts ...Option) *Server {
 	}
 
 	return s
-}
-
-// Addr returns the server's configured address or the active listener's network address if set.
-func (s *Server) Addr() string {
-	if s.listener != nil {
-		return s.listener.Addr().String()
-	}
-	return s.httpServer.Addr
-}
-
-// Handler returns the root HTTP handler configured on the server.
-func (s *Server) Handler() http.Handler {
-	return s.httpServer.Handler
-}
-
-// ShutdownTimeout returns the configured shutdown deadline.
-func (s *Server) ShutdownTimeout() time.Duration {
-	return s.shutdownTimeout
-}
-
-// HTTPServer returns the underlying standard library *http.Server for inspection.
-func (s *Server) HTTPServer() *http.Server {
-	return s.httpServer
 }
 
 // Run starts listening on the configured address and accepts connections until ctx is canceled,

@@ -45,17 +45,6 @@ func (s *InFlightSet) Remove(id uuid.UUID) {
 	delete(s.m, id)
 }
 
-// Contains reports whether id is currently tracked as in-flight.
-func (s *InFlightSet) Contains(id uuid.UUID) bool {
-	if id == uuid.Nil {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, exists := s.m[id]
-	return exists
-}
-
 // Len returns the number of monitor IDs currently in-flight.
 func (s *InFlightSet) Len() int {
 	s.mu.Lock()

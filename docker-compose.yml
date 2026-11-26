@@ -1,46 +1,18 @@
 services:
-  db:
-    image: postgres:16-alpine
-    environment:
-      # Development-only local demo credentials (never use in production)
-      POSTGRES_USER: pulse
-      POSTGRES_PASSWORD: pulse
-      POSTGRES_DB: pulse
-    ports:
-      # Bind PostgreSQL exclusively to loopback on the host for local inspection and integration tests
-      - "127.0.0.1:5432:5432"
-    volumes:
-      - pulse_pgdata:/var/lib/postgresql/data
-      # Initialize the idempotent schema on first DB creation without dropping existing data
-      - ./internal/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pulse -d pulse"]
-      interval: 2s
-      timeout: 5s
-      retries: 15
-      start_period: 5s
-
   app:
     build:
       context: .
       dockerfile: Dockerfile
-    depends_on:
-      db:
-        condition: service_healthy
     environment:
       # App listens on 0.0.0.0:8080 inside the container; host port is published only on 127.0.0.1
       APP_ADDR: 0.0.0.0:8080
-      # Development-only demo credentials pointing to the Compose db service
-      DATABASE_URL: postgres://pulse:pulse@db:5432/pulse?sslmode=disable
-      PULSE_API_KEY: ${PULSE_API_KEY}
+      # Required secrets read from the user's .env file
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set in .env}
+      PULSE_API_KEY: ${PULSE_API_KEY:?PULSE_API_KEY must be set in .env}
+      # Tunable application configuration with safe defaults
       DB_MAX_CONNS: ${DB_MAX_CONNS:-5}
       WORKER_COUNT: ${WORKER_COUNT:-5}
-      QUEUE_CAPACITY: ${QUEUE_CAPACITY:-100}
       SCHEDULER_POLL_INTERVAL: ${SCHEDULER_POLL_INTERVAL:-1s}
-      DEFAULT_MONITOR_INTERVAL: ${DEFAULT_MONITOR_INTERVAL:-60s}
-      DEFAULT_CHECK_TIMEOUT: ${DEFAULT_CHECK_TIMEOUT:-5s}
     ports:
+      # Bind exclusively to localhost for local demonstration
       - "127.0.0.1:8080:8080"
-
-volumes:
-  pulse_pgdata:
