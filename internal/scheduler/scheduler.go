@@ -47,6 +47,7 @@ type Scheduler struct {
 	batchLimit      int
 	defaultTimeout  time.Duration
 	shutdownTimeout time.Duration
+	retention       *RetentionLoop
 	now             func() time.Time
 	logger          *slog.Logger
 }
@@ -104,6 +105,62 @@ func WithShutdownTimeout(d time.Duration) Option {
 	}
 }
 
+// WithRetentionLoop injects an explicit RetentionLoop instance into the scheduler.
+func WithRetentionLoop(loop *RetentionLoop) Option {
+	return func(s *Scheduler) {
+		s.retention = loop
+	}
+}
+
+// WithRetentionStore configures the store used for the background retention loop.
+func WithRetentionStore(retStore RetentionStore) Option {
+	return func(s *Scheduler) {
+		if retStore != nil {
+			loop, err := NewRetentionLoop(retStore, s.logger,
+				WithLoopInterval(DefaultRetentionInterval),
+				WithLoopPeriod(DefaultRetentionPeriod),
+				WithLoopBatchSize(DefaultRetentionBatchSize),
+				WithLoopNowFunc(s.now),
+			)
+			if err == nil {
+				s.retention = loop
+			}
+		} else {
+			s.retention = nil
+		}
+	}
+}
+
+// WithRetentionInterval configures the periodic interval for the retention loop.
+func WithRetentionInterval(d time.Duration) Option {
+	return func(s *Scheduler) {
+		if s.retention != nil && d > 0 {
+			s.retention.interval = d
+		}
+	}
+}
+
+// WithRetentionPeriod configures the retention duration for the retention loop.
+func WithRetentionPeriod(d time.Duration) Option {
+	return func(s *Scheduler) {
+		if s.retention != nil && d > 0 {
+			s.retention.period = d
+		}
+	}
+}
+
+// WithRetentionBatchSize configures the batch size for the retention loop.
+func WithRetentionBatchSize(size int) Option {
+	return func(s *Scheduler) {
+		if s.retention != nil && size > 0 {
+			if size > store.MaxRetentionBatchSize {
+				size = store.MaxRetentionBatchSize
+			}
+			s.retention.batchSize = size
+		}
+	}
+}
+
 // WithNowFunc sets a custom clock function (primarily for deterministic tests).
 func WithNowFunc(now func() time.Time) Option {
 	return func(s *Scheduler) {
@@ -140,6 +197,18 @@ func New(dueStore DueMonitorStore, healthChecker HealthChecker, logger *slog.Log
 		logger:          logger,
 	}
 
+	if retStore, ok := dueStore.(RetentionStore); ok && retStore != nil {
+		retLoop, err := NewRetentionLoop(retStore, logger,
+			WithLoopInterval(DefaultRetentionInterval),
+			WithLoopPeriod(DefaultRetentionPeriod),
+			WithLoopBatchSize(DefaultRetentionBatchSize),
+			WithLoopNowFunc(s.now),
+		)
+		if err == nil {
+			s.retention = retLoop
+		}
+	}
+
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -162,7 +231,12 @@ func (s *Scheduler) InFlight() *InFlightSet {
 	return s.inFlight
 }
 
-// Run starts the worker pool and runs the single scheduler ticker loop until ctx is canceled.
+// RetentionLoop returns the scheduler's background retention loop, or nil if unconfigured.
+func (s *Scheduler) RetentionLoop() *RetentionLoop {
+	return s.retention
+}
+
+// Run starts the worker pool, retention loop (if configured), and runs the single scheduler ticker loop until ctx is canceled.
 // On cancellation, it stops scheduling new checks, closes the work queue only after the
 // polling loop has exited, and waits up to the configured shutdown timeout for workers
 // to finish in-progress checks and persist their results.
@@ -171,6 +245,15 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	defer workerCancel()
 
 	s.pool.Start(workerCtx)
+
+	var retentionDone chan struct{}
+	if s.retention != nil {
+		retentionDone = make(chan struct{})
+		go func() {
+			defer close(retentionDone)
+			_ = s.retention.Run(ctx)
+		}()
+	}
 
 	ticker := time.NewTicker(s.pollInterval)
 	defer ticker.Stop()
@@ -212,6 +295,10 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		)
 		workerCancel()
 		<-done
+	}
+
+	if retentionDone != nil {
+		<-retentionDone
 	}
 
 	return nil

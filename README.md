@@ -80,6 +80,8 @@ PostgreSQL stores exactly two tables (`monitors` and `check_results`), initializ
 - **Transactional Result Persistence**: Inserts check observations and advances `next_check_at` atomically in one PostgreSQL transaction.
 - **Check History & Sliding-Window Stats**: Paginated check history and uptime/latency stats over configurable hour windows (1–720 hours) with strict zero-observation `null` handling.
 - **Basic Outbound SSRF Protections**: Restricts schemes to `http`/`https`, rejects embedded URL credentials, disables redirects and environment proxies, validates all DNS answers inside the dialer (rejecting loopback, RFC 1918/4193 private, link-local, multicast, unspecified, broadcast, CGNAT, and zoned IPv6 addresses, as well as mixed public/private answer sets), dials the validated IP directly while preserving `Host` and TLS SNI, and discards response bodies.
+- **Configurable Connection Cap & Connection Budgeting**: Configurable per-instance `DB_MAX_CONNS` (default `5`, range `1`–`20`) with `MinConns = 0` so idle replicas do not reserve connections. Maximum possible application connections = `instance count × DB_MAX_CONNS`, kept below database/pooler allowances with headroom for administration and migrations.
+- **Bounded 90-Day History Retention**: Integrated background retention loop running once at startup and approximately every 24 hours. Purges check results older than 90 days (3x the maximum 30-day stats window) in bounded batches of at most 1,000 using `(checked_at, id)` index and `FOR UPDATE SKIP LOCKED`. Safely coordinates across concurrent instances without table locks, incidents, or separate services. Monitors and recent check results remain untouched.
 - **Health Probes & Graceful Shutdown**: `/healthz`, `/readyz`, and `SIGINT`/`SIGTERM` handling that drains active checks within a bounded timeout and closes the database pool cleanly.
 
 ---
@@ -159,11 +161,19 @@ Configuration is loaded from environment variables in [`internal/config/config.g
 | `PULSE_API_KEY` | *(none)* | Min 32 characters | Required at startup; secret Bearer token for all `/api/v1/` routes; never logged |
 | `APP_ADDR` | `127.0.0.1:8080` | Valid `host:port` | `docker-compose.yml` sets `0.0.0.0:8080` inside container and publishes `127.0.0.1:8080:8080` |
 | `DATABASE_URL` | `postgres://pulse:pulse@localhost:5432/pulse?sslmode=disable` | `postgres://` or `postgresql://` with host | `docker-compose.yml` sets `@db:5432` for the `app` service; `pulse`/`pulse` are development-only |
+| `DB_MAX_CONNS` | `5` | `1` to `20` | Per-instance pgxpool MaxConns (MinConns=0). Connection budget: `instance count × DB_MAX_CONNS < DB/pooler limit` |
 | `WORKER_COUNT` | `5` | `1` to `64` | Fixed worker pool size |
 | `QUEUE_CAPACITY` | `100` | `1` to `10000` | Bounded in-memory work channel capacity |
 | `SCHEDULER_POLL_INTERVAL` | `1s` | `100ms` to `1h` | Ticker interval for querying due monitors |
 | `DEFAULT_MONITOR_INTERVAL` | `60s` | `30s` to `24h` | Must be `>= DEFAULT_CHECK_TIMEOUT` |
 | `DEFAULT_CHECK_TIMEOUT` | `5s` | `1s` to `30s` | Must be `<= DEFAULT_MONITOR_INTERVAL` |
+
+### Database Connection Budgeting & 90-Day Check History Retention
+
+- **Database Connection Budgeting**: Pulse uses `pgxpool` with a configurable per-instance maximum connection cap (`DB_MAX_CONNS`, default `5`, range `1`–`20`) and `MinConns` set to `0` so idle instances do not reserve unnecessary connections. Connection budget formula:
+  $$\text{maximum possible application connections} = \text{application instance count} \times \text{DB\_MAX\_CONNS}$$
+  Keep this total strictly below the database or connection pooler (e.g. Supabase connection pooler / transaction pooler) allowance, leaving ample connection headroom for administration, migrations, and CLI tools.
+- **90-Day Check History Retention**: The history retention period is fixed at 90 days (three times the maximum 30-day stats calculation window). A background retention task runs once at application startup and then approximately once every 24 hours. Old rows are purged in bounded batches of at most 1,000 using the `idx_check_results_checked_at_id` index and `DELETE ... USING (SELECT id ... FOR UPDATE SKIP LOCKED)` CTEs. Each pass loops until fewer than 1,000 rows are returned, avoiding unbounded DELETE statements. This design allows multiple concurrent Pulse instances to clean up old rows safely without lock contention or deadlocks, without requiring external schedulers (e.g., `pg_cron`), table partitioning, or separate maintenance services. Monitors and recent check results are never deleted as part of retention.
 
 ---
 

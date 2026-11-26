@@ -33,6 +33,7 @@ services:
       # Development-only demo credentials pointing to the Compose db service
       DATABASE_URL: postgres://pulse:pulse@db:5432/pulse?sslmode=disable
       PULSE_API_KEY: ${PULSE_API_KEY}
+      DB_MAX_CONNS: ${DB_MAX_CONNS:-5}
       WORKER_COUNT: ${WORKER_COUNT:-5}
       QUEUE_CAPACITY: ${QUEUE_CAPACITY:-100}
       SCHEDULER_POLL_INTERVAL: ${SCHEDULER_POLL_INTERVAL:-1s}

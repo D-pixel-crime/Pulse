@@ -14,9 +14,10 @@ var SchemaSQL string
 
 const (
 	// DefaultMinConns defines the minimum idle connections kept open in the pool.
-	DefaultMinConns = 2
+	// Set to 0 so idle replicas do not reserve unnecessary connections.
+	DefaultMinConns = 0
 	// DefaultMaxConns defines the maximum concurrent connections allocated for the pool.
-	DefaultMaxConns = 10
+	DefaultMaxConns = 5
 	// DefaultMaxConnLifetime defines the maximum time a connection may be reused.
 	DefaultMaxConnLifetime = 1 * time.Hour
 	// DefaultMaxConnIdleTime defines the maximum time an idle connection can remain open.
@@ -33,6 +34,15 @@ type DB struct {
 
 // Option provides functional configuration for pgxpool.Config.
 type Option func(*pgxpool.Config)
+
+// WithMaxConns configures the maximum concurrent connections allocated for the pool.
+func WithMaxConns(maxConns int32) Option {
+	return func(cfg *pgxpool.Config) {
+		if maxConns > 0 {
+			cfg.MaxConns = maxConns
+		}
+	}
+}
 
 // WithPoolLimits configures explicit connection pool boundaries.
 func WithPoolLimits(minConns, maxConns int32, maxLifetime, maxIdle time.Duration) Option {

@@ -39,7 +39,7 @@ func run() error {
 	defer stop()
 
 	// Initialize database connection pool with sensible limits and ping at startup
-	database, err := db.Connect(ctx, cfg.DatabaseURL)
+	database, err := db.Connect(ctx, cfg.DatabaseURL, db.WithMaxConns(int32(cfg.DBMaxConns)))
 	if err != nil {
 		logger.Error("failed to connect to database", slog.String("error", err.Error()))
 		return fmt.Errorf("database connection error: %w", err)

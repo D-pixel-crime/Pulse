@@ -1,0 +1,106 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+const (
+	// DefaultRetentionDays defines the fixed retention period in days (3x max stats window of 30 days).
+	DefaultRetentionDays = 90
+	// DefaultRetentionPeriod defines the fixed 90-day retention duration.
+	DefaultRetentionPeriod = 90 * 24 * time.Hour
+	// DefaultRetentionBatchSize defines the maximum rows deleted per retention batch query.
+	DefaultRetentionBatchSize = 1000
+	// MaxRetentionBatchSize caps the retention batch size to prevent unbounded deletes.
+	MaxRetentionBatchSize = 1000
+)
+
+type retentionExecer interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+}
+
+// DeleteExpiredCheckResults deletes at most limit (capped at MaxRetentionBatchSize = 1000)
+// check_results older than the cutoff timestamp using a CTE with row-level locks
+// and FOR UPDATE SKIP LOCKED to safely allow concurrent cleanup passes across multiple instances.
+// It returns the number of rows deleted.
+func (s *Store) DeleteExpiredCheckResults(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if s == nil || s.pool == nil {
+		return 0, errors.New("store pool must not be nil")
+	}
+	return s.deleteExpiredCheckResultsWithExecer(ctx, s.pool, cutoff, limit)
+}
+
+func (s *Store) deleteExpiredCheckResultsWithExecer(ctx context.Context, ex retentionExecer, cutoff time.Time, limit int) (int64, error) {
+	if cutoff.IsZero() {
+		cutoff = time.Now().Add(-DefaultRetentionPeriod)
+	}
+	cutoff = cutoff.UTC()
+
+	if limit <= 0 {
+		limit = DefaultRetentionBatchSize
+	}
+	if limit > MaxRetentionBatchSize {
+		limit = MaxRetentionBatchSize
+	}
+
+	const deleteExpiredSQL = `
+		WITH expired AS (
+			SELECT id
+			FROM check_results
+			WHERE checked_at < $1
+			ORDER BY checked_at ASC, id ASC
+			LIMIT $2
+			FOR UPDATE SKIP LOCKED
+		)
+		DELETE FROM check_results cr
+		USING expired
+		WHERE cr.id = expired.id
+	`
+
+	tag, err := ex.Exec(ctx, deleteExpiredSQL, cutoff, limit)
+	if err != nil {
+		return 0, fmt.Errorf("failed to delete expired check results: %w", err)
+	}
+
+	return tag.RowsAffected(), nil
+}
+
+// PurgeExpiredCheckResults deletes expired check_results older than the cutoff timestamp
+// in bounded batches until fewer than batchSize rows are returned.
+// It stops immediately if ctx is canceled and does not perform one unbounded DELETE.
+func (s *Store) PurgeExpiredCheckResults(ctx context.Context, cutoff time.Time, batchSize int) (int64, error) {
+	if s == nil || s.pool == nil {
+		return 0, errors.New("store pool must not be nil")
+	}
+	if batchSize <= 0 {
+		batchSize = DefaultRetentionBatchSize
+	}
+	if batchSize > MaxRetentionBatchSize {
+		batchSize = MaxRetentionBatchSize
+	}
+	if cutoff.IsZero() {
+		cutoff = time.Now().Add(-DefaultRetentionPeriod)
+	}
+	cutoff = cutoff.UTC()
+
+	var totalDeleted int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return totalDeleted, err
+		}
+		deleted, err := s.DeleteExpiredCheckResults(ctx, cutoff, batchSize)
+		if err != nil {
+			return totalDeleted, err
+		}
+		totalDeleted += deleted
+		if deleted < int64(batchSize) {
+			break
+		}
+	}
+	return totalDeleted, nil
+}

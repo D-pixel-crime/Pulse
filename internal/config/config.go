@@ -19,6 +19,7 @@ const (
 	DefaultSchedulerPollInterval = 1 * time.Second
 	DefaultMonitorInterval       = 60 * time.Second
 	DefaultCheckTimeout          = 5 * time.Second
+	DefaultDBMaxConns            = 5
 
 	MinWorkerCount           = 1
 	MaxWorkerCount           = 64
@@ -30,6 +31,8 @@ const (
 	MaxMonitorInterval       = 24 * time.Hour
 	MinCheckTimeout          = 1 * time.Second
 	MaxCheckTimeout          = 30 * time.Second
+	MinDBMaxConns            = 1
+	MaxDBMaxConns            = 20
 
 	MinAPIKeyLength = 32
 )
@@ -44,6 +47,7 @@ type Config struct {
 	SchedulerPollInterval  time.Duration `json:"scheduler_poll_interval"`
 	DefaultMonitorInterval time.Duration `json:"default_monitor_interval"`
 	DefaultCheckTimeout    time.Duration `json:"default_check_timeout"`
+	DBMaxConns             int           `json:"db_max_conns"`
 }
 
 // NewDefault returns a Config initialized with standard specification defaults.
@@ -56,6 +60,7 @@ func NewDefault() *Config {
 		SchedulerPollInterval:  DefaultSchedulerPollInterval,
 		DefaultMonitorInterval: DefaultMonitorInterval,
 		DefaultCheckTimeout:    DefaultCheckTimeout,
+		DBMaxConns:             DefaultDBMaxConns,
 	}
 }
 
@@ -108,6 +113,13 @@ func LoadWithLookup(lookup func(string) (string, bool)) (*Config, error) {
 			return nil, fmt.Errorf("invalid DEFAULT_CHECK_TIMEOUT: %w", err)
 		}
 		cfg.DefaultCheckTimeout = d
+	}
+	if val, ok := lookup("DB_MAX_CONNS"); ok {
+		n, err := strconv.Atoi(val)
+		if err != nil {
+			return nil, fmt.Errorf("invalid DB_MAX_CONNS: %w", err)
+		}
+		cfg.DBMaxConns = n
 	}
 	if val, ok := lookup("PULSE_API_KEY"); ok {
 		cfg.APIKey = val
@@ -175,6 +187,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("DEFAULT_CHECK_TIMEOUT (%s) must not exceed DEFAULT_MONITOR_INTERVAL (%s)", c.DefaultCheckTimeout, c.DefaultMonitorInterval)
 	}
 
+	if c.DBMaxConns < MinDBMaxConns || c.DBMaxConns > MaxDBMaxConns {
+		return fmt.Errorf("DB_MAX_CONNS must be between %d and %d, got %d", MinDBMaxConns, MaxDBMaxConns, c.DBMaxConns)
+	}
+
 	if c.APIKey == "" {
 		return errors.New("PULSE_API_KEY must not be empty")
 	}
@@ -210,5 +226,6 @@ func (c *Config) LogValue() slog.Value {
 		slog.Duration("scheduler_poll_interval", c.SchedulerPollInterval),
 		slog.Duration("default_monitor_interval", c.DefaultMonitorInterval),
 		slog.Duration("default_check_timeout", c.DefaultCheckTimeout),
+		slog.Int("db_max_conns", c.DBMaxConns),
 	)
 }

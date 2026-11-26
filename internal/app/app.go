@@ -172,6 +172,14 @@ func (a *App) Scheduler() *scheduler.Scheduler {
 	return a.scheduler
 }
 
+// RetentionLoop returns the configured retention loop from the scheduler, or nil if unconfigured.
+func (a *App) RetentionLoop() *scheduler.RetentionLoop {
+	if a.scheduler != nil {
+		return a.scheduler.RetentionLoop()
+	}
+	return nil
+}
+
 // Run executes the application lifecycle, coordinating the HTTP server and background
 // scheduler/worker pool until ctx is canceled or a component fails.
 func (a *App) Run(ctx context.Context) error {

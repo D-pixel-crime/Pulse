@@ -43,3 +43,7 @@ ON monitors (created_at DESC, id DESC);
 -- Index for recent history lookup and stats aggregation by monitor
 CREATE INDEX IF NOT EXISTS idx_check_results_monitor_checked_at 
 ON check_results (monitor_id, checked_at DESC);
+
+-- Index for retention scans and batch cleanup
+CREATE INDEX IF NOT EXISTS idx_check_results_checked_at_id
+ON check_results (checked_at, id);
